@@ -1,4 +1,7 @@
 python-telegram-bot[job-queue]
-requests
+aiohttp
+aiosqlite
 pandas
 numpy
+python-dotenv
+cachetools
