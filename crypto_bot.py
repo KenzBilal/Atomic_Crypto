@@ -1999,6 +1999,24 @@ async def generatepost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
+async def postsignals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: manually trigger a channel signal post"""
+    if int(update.effective_user.id) != ADMIN_ID:
+        return
+    await update.message.reply_text("⏳ Posting signals to channel...")
+    try:
+        now = datetime.now(timezone.utc)
+        msg = await build_signal_message(now)
+        await context.bot.send_message(
+            chat_id=CHANNEL_USERNAME,
+            text=msg,
+            parse_mode=None,
+            disable_web_page_preview=True
+        )
+        await update.message.reply_text("✅ Signals posted to channel!")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
