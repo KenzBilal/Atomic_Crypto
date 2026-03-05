@@ -1,276 +1,471 @@
-import requests
-import pandas as pd
-import numpy as np
-import json
+"""
+⚡ ATOMIC CRYPTO BOT — PROFESSIONAL EDITION v3.0
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+v3.0 Upgrades:
+  ✅ SQLite database (aiosqlite) — no data loss
+  ✅ Fully async HTTP (aiohttp) — never freezes
+  ✅ Smart caching (cachetools) — no rate limits
+  ✅ .env security — no hardcoded secrets
+  ✅ Optimized alerts — grouped by symbol
+  ✅ Specific exception handling
+  ✅ Pandas .loc fixes
+  ✅ All v2.0 features preserved
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
 import os
 import asyncio
 import logging
-from datetime import datetime, timezone
+import aiosqlite
+import aiohttp
+import pandas as pd
+import numpy as np
+from datetime import datetime, timezone, timedelta
+from dotenv import load_dotenv
+from cachetools import TTLCache
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    LabeledPrice, PreCheckoutQuery
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes, MessageHandler, PreCheckoutQueryHandler,
-    filters
+    ContextTypes, MessageHandler, PreCheckoutQueryHandler, filters
 )
 
+load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = "8726083513:AAGxtqLZeBLGOy6RRdoKYzHmJjo8Vr1C5pU"
-ADMIN_ID       = 8466348943
-DATA_FILE      = "atomic_data.json"
-GROK_API_KEY = os.environ.get("GROK_API_KEY", "")
+TELEGRAM_TOKEN        = os.environ["TELEGRAM_TOKEN"]
+ADMIN_ID              = int(os.environ.get("ADMIN_ID", "8466348943"))
+GROK_API_KEY          = os.environ.get("GROK_API_KEY", "")
+DB_FILE               = "atomic_v3.db"
 
-# Pricing (Telegram Stars)
-PREMIUM_MONTHLY_STARS   = 500    # ~$4.99
-PREMIUM_LIFETIME_STARS  = 2500   # ~$29.99
+PREMIUM_MONTHLY_STARS  = 500
+PREMIUM_LIFETIME_STARS = 2500
 
-# Channel
 CHANNEL_USERNAME = "@AtomicCryptoSignals"
 CHANNEL_LINK     = "https://t.me/AtomicCryptoSignals"
 
-# Affiliate Links
 BINGX_LINK   = "https://bingx.pro/invite/IYJKPY/"
 BINGX_CODE   = "IYJKPY"
 BINANCE_LINK = "https://www.binance.com/referral/earn-together/refer2earn-usdc/claim?ref=GRO_28502_7P65U"
 
-# Daily signal coins
-SIGNAL_COINS = ["BTC", "ETH", "BNB", "SOL", "XRP"]
-TOP_COINS    = ["BTC", "ETH", "BNB", "SOL", "XRP"]
-
-# Free tier limits
+SIGNAL_COINS          = ["BTC", "ETH", "BNB", "SOL", "XRP"]
+TOP_COINS             = ["BTC", "ETH", "BNB", "SOL", "XRP"]
 FREE_ANALYSES_PER_DAY = 3
 FREE_COINS            = ["BTC", "ETH"]
-FREE_TIMEFRAMES       = ["1d"]
 
-# ── LOGO HEADER ───────────────────────────────────────────────────────────────
-LOGO = "⚡ *ATOMIC CRYPTO*"
+LOGO    = "⚡ *ATOMIC CRYPTO*"
 DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# ── DATA PERSISTENCE ──────────────────────────────────────────────────────────
-def load_data() -> dict:
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return {}
+# ── CACHE (TTL in seconds) ────────────────────────────────────────────────────
+_price_cache    = TTLCache(maxsize=100, ttl=60)    # 1 min
+_ohlcv_cache    = TTLCache(maxsize=50,  ttl=120)   # 2 min
+_24h_cache      = TTLCache(maxsize=50,  ttl=60)    # 1 min
+_fg_cache       = TTLCache(maxsize=1,   ttl=300)   # 5 min
+_news_cache     = TTLCache(maxsize=1,   ttl=600)   # 10 min
+_movers_cache   = TTLCache(maxsize=1,   ttl=120)   # 2 min
+_coininfo_cache = TTLCache(maxsize=30,  ttl=300)   # 5 min
 
-def save_data(data: dict):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+# ── DATABASE ──────────────────────────────────────────────────────────────────
+async def init_db():
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                uid             TEXT PRIMARY KEY,
+                username        TEXT DEFAULT '',
+                premium         INTEGER DEFAULT 0,
+                premium_type    TEXT DEFAULT '',
+                premium_expiry  TEXT DEFAULT '',
+                referral_code   TEXT DEFAULT '',
+                referred_by     TEXT DEFAULT '',
+                analyses_today  INTEGER DEFAULT 0,
+                analyses_date   TEXT DEFAULT '',
+                total_analyses  INTEGER DEFAULT 0,
+                signal_time     TEXT DEFAULT '09:00',
+                signal_enabled  INTEGER DEFAULT 1,
+                join_date       TEXT DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS alerts (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                uid       TEXT NOT NULL,
+                symbol    TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                target    REAL NOT NULL,
+                chat_id   INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS watchlist (
+                uid    TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                PRIMARY KEY (uid, symbol)
+            );
+            CREATE TABLE IF NOT EXISTS portfolio (
+                uid       TEXT NOT NULL,
+                symbol    TEXT NOT NULL,
+                amount    REAL NOT NULL,
+                buy_price REAL NOT NULL,
+                PRIMARY KEY (uid, symbol)
+            );
+            CREATE TABLE IF NOT EXISTS referrals (
+                referrer_uid TEXT NOT NULL,
+                referred_uid TEXT NOT NULL,
+                PRIMARY KEY (referrer_uid, referred_uid)
+            );
+        """)
+        await db.commit()
 
-def get_user(uid: str) -> dict:
-    data = load_data()
-    if uid not in data:
-        data[uid] = {
-            "watchlist":       [],
-            "alerts":          [],
-            "portfolio":       {},
-            "premium":         False,
-            "premium_type":    None,
-            "premium_expiry":  None,
-            "referral_code":   f"REF{uid[-6:]}",
-            "referred_by":     None,
-            "referrals":       [],
-            "analyses_today":  0,
-            "analyses_date":   "",
-            "signal_time":     "09:00",
-            "signal_enabled":  True,
-            "join_date":       datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-            "username":        "",
-            "total_analyses":  0,
-        }
-        save_data(data)
-    return data[uid]
+async def get_user(uid: str) -> dict:
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM users WHERE uid=?", (uid,)) as cur:
+            row = await cur.fetchone()
+        if row:
+            return dict(row)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        ref_code = f"REF{uid[-6:]}"
+        await db.execute("""
+            INSERT INTO users (uid, referral_code, join_date)
+            VALUES (?, ?, ?)
+        """, (uid, ref_code, today))
+        await db.commit()
+        async with db.execute("SELECT * FROM users WHERE uid=?", (uid,)) as cur:
+            row = await cur.fetchone()
+        return dict(row)
 
-def update_user(uid: str, user: dict):
-    data = load_data()
-    data[uid] = user
-    save_data(data)
+async def update_user(uid: str, **kwargs):
+    if not kwargs:
+        return
+    cols = ", ".join(f"{k}=?" for k in kwargs)
+    vals = list(kwargs.values()) + [uid]
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(f"UPDATE users SET {cols} WHERE uid=?", vals)
+        await db.commit()
 
-def is_premium(uid: str) -> bool:
-    user = get_user(uid)
-    if not user.get("premium"):
+async def is_premium(uid: str) -> bool:
+    user = await get_user(uid)
+    if not user["premium"]:
         return False
-    if user.get("premium_type") == "lifetime":
+    if user["premium_type"] == "lifetime":
         return True
-    expiry = user.get("premium_expiry")
+    expiry = user.get("premium_expiry", "")
     if expiry:
-        exp_date = datetime.fromisoformat(expiry)
-        if datetime.now(timezone.utc) < exp_date:
-            return True
-        else:
-            user["premium"] = False
-            update_user(uid, user)
-            return False
+        try:
+            exp = datetime.fromisoformat(expiry)
+            if datetime.now(timezone.utc) < exp:
+                return True
+            await update_user(uid, premium=0, premium_type="", premium_expiry="")
+        except Exception:
+            pass
     return False
 
-def check_daily_limit(uid: str) -> tuple[bool, int]:
-    """Returns (can_analyze, remaining)"""
-    if is_premium(uid):
+async def check_daily_limit(uid: str) -> tuple:
+    if await is_premium(uid):
         return True, 999
-    user = get_user(uid)
+    user  = await get_user(uid)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if user.get("analyses_date") != today:
-        user["analyses_today"] = 0
-        user["analyses_date"] = today
-        update_user(uid, user)
-    remaining = FREE_ANALYSES_PER_DAY - user.get("analyses_today", 0)
-    return remaining > 0, remaining
+    if user["analyses_date"] != today:
+        await update_user(uid, analyses_today=0, analyses_date=today)
+        return True, FREE_ANALYSES_PER_DAY
+    remaining = FREE_ANALYSES_PER_DAY - user["analyses_today"]
+    return remaining > 0, max(0, remaining)
 
-def increment_analysis(uid: str):
-    user = get_user(uid)
+async def increment_analysis(uid: str):
+    user  = await get_user(uid)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if user.get("analyses_date") != today:
-        user["analyses_today"] = 0
-        user["analyses_date"] = today
-    user["analyses_today"] = user.get("analyses_today", 0) + 1
-    user["total_analyses"]  = user.get("total_analyses", 0) + 1
-    update_user(uid, user)
+    count = user["analyses_today"] if user["analyses_date"] == today else 0
+    await update_user(
+        uid,
+        analyses_today=count + 1,
+        analyses_date=today,
+        total_analyses=user["total_analyses"] + 1
+    )
 
-# ── API HELPERS ───────────────────────────────────────────────────────────────
+async def get_alerts(uid: str = None) -> list:
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        if uid:
+            async with db.execute("SELECT * FROM alerts WHERE uid=?", (uid,)) as cur:
+                rows = await cur.fetchall()
+        else:
+            async with db.execute("SELECT * FROM alerts", ()) as cur:
+                rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+async def add_alert(uid: str, symbol: str, direction: str, target: float, chat_id: int):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO alerts (uid, symbol, direction, target, chat_id) VALUES (?,?,?,?,?)",
+            (uid, symbol, direction, target, chat_id)
+        )
+        await db.commit()
+
+async def delete_alert(alert_id: int):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("DELETE FROM alerts WHERE id=?", (alert_id,))
+        await db.commit()
+
+async def get_watchlist(uid: str) -> list:
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("SELECT symbol FROM watchlist WHERE uid=?", (uid,)) as cur:
+            rows = await cur.fetchall()
+    return [r[0] for r in rows]
+
+async def add_watchlist(uid: str, symbol: str):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO watchlist (uid, symbol) VALUES (?,?)", (uid, symbol)
+        )
+        await db.commit()
+
+async def remove_watchlist(uid: str, symbol: str):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("DELETE FROM watchlist WHERE uid=? AND symbol=?", (uid, symbol))
+        await db.commit()
+
+async def get_portfolio(uid: str) -> list:
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM portfolio WHERE uid=?", (uid,)) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+async def upsert_portfolio(uid: str, symbol: str, amount: float, buy_price: float):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO portfolio (uid, symbol, amount, buy_price) VALUES (?,?,?,?)",
+            (uid, symbol, amount, buy_price)
+        )
+        await db.commit()
+
+async def clear_portfolio(uid: str):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("DELETE FROM portfolio WHERE uid=?", (uid,))
+        await db.commit()
+
+async def get_referrals(uid: str) -> list:
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT referred_uid FROM referrals WHERE referrer_uid=?", (uid,)
+        ) as cur:
+            rows = await cur.fetchall()
+    return [r[0] for r in rows]
+
+async def add_referral(referrer_uid: str, referred_uid: str):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO referrals (referrer_uid, referred_uid) VALUES (?,?)",
+            (referrer_uid, referred_uid)
+        )
+        await db.commit()
+
+# ── HELPERS ───────────────────────────────────────────────────────────────────
 def clean_symbol(symbol: str) -> str:
     return symbol.upper().strip().replace("USDT","").replace("BUSD","").replace("/","").replace("-","")
 
-def fetch_ohlcv(symbol: str, interval: str, limit: int = 200):
+# ── ASYNC API CALLS ───────────────────────────────────────────────────────────
+async def fetch_ohlcv(symbol: str, interval: str, limit: int = 200):
     symbol = clean_symbol(symbol)
+    cache_key = f"{symbol}_{interval}"
+    if cache_key in _ohlcv_cache:
+        return _ohlcv_cache[cache_key]
     interval_map = {"1h": "1hour", "4h": "4hour", "1d": "1day"}
-    kc_interval = interval_map.get(interval, "1hour")
+    kc_interval  = interval_map.get(interval, "1hour")
     pair = f"{symbol}-USDT"
     try:
-        r = requests.get(
-            "https://api.kucoin.com/api/v1/market/candles",
-            params={"symbol": pair, "type": kc_interval},
-            timeout=10
-        )
-        data = r.json().get("data", [])
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.kucoin.com/api/v1/market/candles",
+                params={"symbol": pair, "type": kc_interval},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                data = (await r.json()).get("data", [])
         if not data:
             return None
         data = list(reversed(data))[-limit:]
         df = pd.DataFrame(data, columns=["open_time","open","close","high","low","volume","turnover"])
         for col in ["open","high","low","close","volume"]:
             df[col] = df[col].astype(float)
+        _ohlcv_cache[cache_key] = df
         return df
-    except:
+    except aiohttp.ClientError as e:
+        logger.error(f"fetch_ohlcv error: {e}")
         return None
 
-def fetch_price(symbol: str) -> float | None:
+async def fetch_price(symbol: str) -> float | None:
     symbol = clean_symbol(symbol)
+    if symbol in _price_cache:
+        return _price_cache[symbol]
     try:
-        r = requests.get(
-            "https://api.kucoin.com/api/v1/market/orderbook/level1",
-            params={"symbol": f"{symbol}-USDT"},
-            timeout=5
-        )
-        return float(r.json()["data"]["price"])
-    except:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.kucoin.com/api/v1/market/orderbook/level1",
+                params={"symbol": f"{symbol}-USDT"},
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as r:
+                price = float((await r.json())["data"]["price"])
+        _price_cache[symbol] = price
+        return price
+    except (aiohttp.ClientError, KeyError, TypeError) as e:
+        logger.error(f"fetch_price error {symbol}: {e}")
         return None
 
-def fetch_24h(symbol: str) -> dict | None:
+async def fetch_24h(symbol: str) -> dict | None:
     symbol = clean_symbol(symbol)
+    if symbol in _24h_cache:
+        return _24h_cache[symbol]
     try:
-        r = requests.get(
-            "https://api.kucoin.com/api/v1/market/stats",
-            params={"symbol": f"{symbol}-USDT"},
-            timeout=5
-        )
-        d = r.json().get("data", {})
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.kucoin.com/api/v1/market/stats",
+                params={"symbol": f"{symbol}-USDT"},
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as r:
+                d = (await r.json()).get("data", {})
         if not d:
             return None
         last   = float(d.get("last", 0))
         open_  = float(d.get("open", 1))
         change = ((last - open_) / open_ * 100) if open_ else 0
-        return {
-            "price":  last,
-            "change": round(change, 2),
-            "high":   float(d.get("high", 0)),
-            "low":    float(d.get("low", 0)),
-            "vol":    float(d.get("volValue", 0)),
+        result = {
+            "price": last, "change": round(change, 2),
+            "high": float(d.get("high", 0)), "low": float(d.get("low", 0)),
+            "vol": float(d.get("volValue", 0)),
         }
-    except:
+        _24h_cache[symbol] = result
+        return result
+    except (aiohttp.ClientError, KeyError, TypeError) as e:
+        logger.error(f"fetch_24h error {symbol}: {e}")
         return None
 
-def fetch_fear_greed() -> dict:
+async def fetch_fear_greed() -> dict:
+    if "fg" in _fg_cache:
+        return _fg_cache["fg"]
     try:
-        r = requests.get("https://api.alternative.me/fng/", timeout=5)
-        d = r.json()["data"][0]
-        return {"value": int(d["value"]), "label": d["value_classification"]}
-    except:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.alternative.me/fng/",
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as r:
+                d = (await r.json())["data"][0]
+        result = {"value": int(d["value"]), "label": d["value_classification"]}
+        _fg_cache["fg"] = result
+        return result
+    except (aiohttp.ClientError, KeyError) as e:
+        logger.error(f"fetch_fear_greed error: {e}")
         return {"value": 50, "label": "Unknown"}
 
-def fetch_news() -> list:
+async def fetch_news() -> list:
+    if "news" in _news_cache:
+        return _news_cache["news"]
     try:
-        r = requests.get(
-            "https://min-api.cryptocompare.com/data/v2/news/?lang=EN&sortOrder=latest",
-            timeout=8
-        )
-        items = r.json().get("Data", [])[:5]
-        return [{"title": i["title"], "url": i["url"], "source": i["source_info"]["name"]} for i in items]
-    except:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://min-api.cryptocompare.com/data/v2/news/?lang=EN&sortOrder=latest",
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as r:
+                items = (await r.json()).get("Data", [])[:5]
+        result = [{"title": i["title"], "url": i["url"], "source": i["source_info"]["name"]} for i in items]
+        _news_cache["news"] = result
+        return result
+    except (aiohttp.ClientError, KeyError) as e:
+        logger.error(f"fetch_news error: {e}")
         return []
 
-def fetch_top_movers() -> dict:
-    """Fetch top gainers and losers from KuCoin"""
+async def fetch_top_movers() -> dict:
+    if "movers" in _movers_cache:
+        return _movers_cache["movers"]
     try:
-        r = requests.get("https://api.kucoin.com/api/v1/market/allTickers", timeout=10)
-        tickers = r.json().get("data", {}).get("ticker", [])
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.kucoin.com/api/v1/market/allTickers",
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                tickers = (await r.json()).get("data", {}).get("ticker", [])
         usdt = [t for t in tickers if t["symbol"].endswith("-USDT") and t.get("changeRate")]
         usdt = [t for t in usdt if float(t.get("vol", 0)) > 100000]
         usdt.sort(key=lambda x: float(x.get("changeRate", 0)), reverse=True)
-        gainers = usdt[:5]
-        losers  = list(reversed(usdt))[:5]
-        return {"gainers": gainers, "losers": losers}
-    except:
+        result = {"gainers": usdt[:5], "losers": list(reversed(usdt))[:5]}
+        _movers_cache["movers"] = result
+        return result
+    except (aiohttp.ClientError, KeyError) as e:
+        logger.error(f"fetch_top_movers error: {e}")
         return {"gainers": [], "losers": []}
 
-def fetch_coin_info(symbol: str) -> dict | None:
-    """Fetch coin fundamentals from CoinGecko"""
+async def fetch_coin_info(symbol: str) -> dict | None:
+    symbol = clean_symbol(symbol)
+    if symbol in _coininfo_cache:
+        return _coininfo_cache[symbol]
     id_map = {
-        "BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin",
-        "SOL": "solana",  "XRP": "ripple",   "ADA": "cardano",
-        "DOGE": "dogecoin", "MATIC": "matic-network", "DOT": "polkadot",
-        "LINK": "chainlink", "AVAX": "avalanche-2", "ATOM": "cosmos",
-        "UNI": "uniswap", "LTC": "litecoin", "BCH": "bitcoin-cash",
+        "BTC":"bitcoin","ETH":"ethereum","BNB":"binancecoin","SOL":"solana",
+        "XRP":"ripple","ADA":"cardano","DOGE":"dogecoin","MATIC":"matic-network",
+        "DOT":"polkadot","LINK":"chainlink","AVAX":"avalanche-2","ATOM":"cosmos",
+        "UNI":"uniswap","LTC":"litecoin","BCH":"bitcoin-cash",
     }
-    coin_id = id_map.get(clean_symbol(symbol).upper())
-    if not coin_id:
-        coin_id = clean_symbol(symbol).lower()
+    coin_id = id_map.get(symbol, symbol.lower())
     try:
-        r = requests.get(
-            f"https://api.coingecko.com/api/v3/coins/{coin_id}",
-            params={"localization": "false", "tickers": "false", "community_data": "false"},
-            timeout=10
-        )
-        d = r.json()
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://api.coingecko.com/api/v3/coins/{coin_id}",
+                params={"localization":"false","tickers":"false","community_data":"false"},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                d = await r.json()
         if "error" in d:
             return None
         md = d.get("market_data", {})
-        return {
-            "name":        d.get("name", symbol),
-            "symbol":      d.get("symbol", "").upper(),
-            "rank":        d.get("market_cap_rank", "N/A"),
-            "price":       md.get("current_price", {}).get("usd", 0),
-            "market_cap":  md.get("market_cap", {}).get("usd", 0),
-            "volume_24h":  md.get("total_volume", {}).get("usd", 0),
-            "change_24h":  md.get("price_change_percentage_24h", 0),
-            "change_7d":   md.get("price_change_percentage_7d", 0),
-            "change_30d":  md.get("price_change_percentage_30d", 0),
-            "ath":         md.get("ath", {}).get("usd", 0),
-            "ath_change":  md.get("ath_change_percentage", {}).get("usd", 0),
-            "supply":      md.get("circulating_supply", 0),
-            "max_supply":  md.get("max_supply", 0),
-            "description": d.get("description", {}).get("en", "")[:300],
+        result = {
+            "name":       d.get("name", symbol),
+            "symbol":     d.get("symbol","").upper(),
+            "rank":       d.get("market_cap_rank","N/A"),
+            "price":      md.get("current_price",{}).get("usd",0),
+            "market_cap": md.get("market_cap",{}).get("usd",0),
+            "volume_24h": md.get("total_volume",{}).get("usd",0),
+            "change_24h": md.get("price_change_percentage_24h",0),
+            "change_7d":  md.get("price_change_percentage_7d",0),
+            "change_30d": md.get("price_change_percentage_30d",0),
+            "ath":        md.get("ath",{}).get("usd",0),
+            "ath_change": md.get("ath_change_percentage",{}).get("usd",0),
+            "supply":     md.get("circulating_supply",0),
+            "max_supply": md.get("max_supply",0),
+            "description":d.get("description",{}).get("en","")[:300],
         }
-    except:
+        _coininfo_cache[symbol] = result
+        return result
+    except (aiohttp.ClientError, KeyError) as e:
+        logger.error(f"fetch_coin_info error {symbol}: {e}")
+        return None
+
+async def call_grok(prompt: str) -> str | None:
+    if not GROK_API_KEY:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.x.ai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROK_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": "grok-3-fast",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 300,
+                    "temperature": 0.7
+                },
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as r:
+                result = await r.json()
+        if "choices" not in result:
+            logger.error(f"Grok error: {result}")
+            return None
+        return result["choices"][0]["message"]["content"].strip()
+    except (aiohttp.ClientError, KeyError) as e:
+        logger.error(f"call_grok error: {e}")
         return None
 
 # ── TECHNICAL INDICATORS ──────────────────────────────────────────────────────
 def compute_all(df: pd.DataFrame) -> dict:
-    c = df["close"]; h = df["high"]; l = df["low"]
-    o = df["open"];  v = df["volume"]; n = len(df)
+    c = df["close"].copy(); h = df["high"].copy()
+    l = df["low"].copy();   o = df["open"].copy()
+    v = df["volume"].copy(); n = len(df)
 
     delta = c.diff()
     gain  = delta.clip(lower=0).rolling(14).mean()
@@ -295,16 +490,16 @@ def compute_all(df: pd.DataFrame) -> dict:
     bb_lower = sma20 - 2 * std20
     bb_pct_b = (c - bb_lower) / (bb_upper - bb_lower).replace(0, np.nan)
     bb_bw    = (bb_upper - bb_lower) / sma20
-    bb_squeeze = bb_bw.iloc[-1] < bb_bw.rolling(20).mean().iloc[-1]
+    bb_squeeze = bool(bb_bw.iloc[-1] < bb_bw.rolling(20).mean().iloc[-1])
 
     ema9   = c.ewm(span=9,   adjust=False).mean()
     ema21  = c.ewm(span=21,  adjust=False).mean()
     ema50  = c.ewm(span=50,  adjust=False).mean()
     ema200 = c.ewm(span=200, adjust=False).mean()
-    golden_cross   = ema50.iloc[-1] > ema200.iloc[-1] and ema50.iloc[-2] <= ema200.iloc[-2]
-    death_cross    = ema50.iloc[-1] < ema200.iloc[-1] and ema50.iloc[-2] >= ema200.iloc[-2]
-    ema_stack_bull = ema9.iloc[-1] > ema21.iloc[-1] > ema50.iloc[-1] > ema200.iloc[-1]
-    ema_stack_bear = ema9.iloc[-1] < ema21.iloc[-1] < ema50.iloc[-1] < ema200.iloc[-1]
+    golden_cross   = bool(ema50.iloc[-1] > ema200.iloc[-1] and ema50.iloc[-2] <= ema200.iloc[-2])
+    death_cross    = bool(ema50.iloc[-1] < ema200.iloc[-1] and ema50.iloc[-2] >= ema200.iloc[-2])
+    ema_stack_bull = bool(ema9.iloc[-1] > ema21.iloc[-1] > ema50.iloc[-1] > ema200.iloc[-1])
+    ema_stack_bear = bool(ema9.iloc[-1] < ema21.iloc[-1] < ema50.iloc[-1] < ema200.iloc[-1])
 
     rsi14   = rsi.rolling(14)
     stoch_r = (rsi - rsi14.min()) / (rsi14.max() - rsi14.min()).replace(0, np.nan)
@@ -329,110 +524,100 @@ def compute_all(df: pd.DataFrame) -> dict:
     tp  = (h + l + c) / 3
     cci = (tp - tp.rolling(20).mean()) / (0.015 * tp.rolling(20).std())
 
+    # Parabolic SAR
     af, max_af = 0.02, 0.2
-    sar = c.copy(); bull = True; ep = l.iloc[0]; _af = af
+    sar_vals = c.values.copy().astype(float)
+    bull_flag = True; ep = float(l.iloc[0]); _af = af
     for i in range(2, n):
-        prev = sar.iloc[i-1]
-        if bull:
-            sar.iloc[i] = min(prev + _af*(ep-prev), l.iloc[i-1], l.iloc[i-2])
-            if l.iloc[i] < sar.iloc[i]:
-                bull=False; sar.iloc[i]=ep; ep=h.iloc[i]; _af=af
-            elif h.iloc[i] > ep:
-                ep=h.iloc[i]; _af=min(_af+af,max_af)
+        prev = sar_vals[i-1]
+        if bull_flag:
+            sar_vals[i] = min(prev + _af*(ep-prev), float(l.iloc[i-1]), float(l.iloc[i-2]))
+            if float(l.iloc[i]) < sar_vals[i]:
+                bull_flag=False; sar_vals[i]=ep; ep=float(h.iloc[i]); _af=af
+            elif float(h.iloc[i]) > ep:
+                ep=float(h.iloc[i]); _af=min(_af+af,max_af)
         else:
-            sar.iloc[i] = max(prev + _af*(ep-prev), h.iloc[i-1], h.iloc[i-2])
-            if h.iloc[i] > sar.iloc[i]:
-                bull=True; sar.iloc[i]=ep; ep=l.iloc[i]; _af=af
-            elif l.iloc[i] < ep:
-                ep=l.iloc[i]; _af=min(_af+af,max_af)
-    psar_bull = c.iloc[-1] > sar.iloc[-1]
+            sar_vals[i] = max(prev + _af*(ep-prev), float(h.iloc[i-1]), float(h.iloc[i-2]))
+            if float(h.iloc[i]) > sar_vals[i]:
+                bull_flag=True; sar_vals[i]=ep; ep=float(l.iloc[i]); _af=af
+            elif float(l.iloc[i]) < ep:
+                ep=float(l.iloc[i]); _af=min(_af+af,max_af)
+    psar_bull = bool(c.iloc[-1] > sar_vals[-1])
 
-    plus_dm  = h.diff().clip(lower=0)
-    minus_dm = (-l.diff()).clip(lower=0)
-    plus_dm[plus_dm < minus_dm]  = 0
-    minus_dm[minus_dm < plus_dm] = 0
+    # ADX — fixed with .loc
+    plus_dm  = h.diff().clip(lower=0).copy()
+    minus_dm = (-l.diff()).clip(lower=0).copy()
+    plus_dm.loc[plus_dm < minus_dm]   = 0
+    minus_dm.loc[minus_dm < plus_dm]  = 0
     atr14s   = tr.rolling(14).sum()
-    plus_di  = 100 * plus_dm.rolling(14).sum() / atr14s.replace(0,np.nan)
-    minus_di = 100 * minus_dm.rolling(14).sum() / atr14s.replace(0,np.nan)
-    dx       = (abs(plus_di-minus_di)/(plus_di+minus_di).replace(0,np.nan))*100
+    plus_di  = 100 * plus_dm.rolling(14).sum() / atr14s.replace(0, np.nan)
+    minus_di = 100 * minus_dm.rolling(14).sum() / atr14s.replace(0, np.nan)
+    dx       = (abs(plus_di-minus_di) / (plus_di+minus_di).replace(0, np.nan)) * 100
     adx      = dx.rolling(14).mean()
     trend_strength = "Strong" if adx.iloc[-1] > 25 else "Weak"
 
+    # Ichimoku
     tenkan   = (h.rolling(9).max()  + l.rolling(9).min())  / 2
     kijun    = (h.rolling(26).max() + l.rolling(26).min()) / 2
-    senkou_a = ((tenkan+kijun)/2).shift(26)
-    senkou_b = ((h.rolling(52).max()+l.rolling(52).min())/2).shift(26)
-    ichi_bull = c.iloc[-1] > senkou_a.iloc[-1] and c.iloc[-1] > senkou_b.iloc[-1]
-    ichi_bear = c.iloc[-1] < senkou_a.iloc[-1] and c.iloc[-1] < senkou_b.iloc[-1]
-    tk_cross_bull = tenkan.iloc[-1] > kijun.iloc[-1] and tenkan.iloc[-2] <= kijun.iloc[-2]
-    tk_cross_bear = tenkan.iloc[-1] < kijun.iloc[-1] and tenkan.iloc[-2] >= kijun.iloc[-2]
+    senkou_a = ((tenkan + kijun) / 2).shift(26)
+    senkou_b = ((h.rolling(52).max() + l.rolling(52).min()) / 2).shift(26)
+    ichi_bull    = bool(c.iloc[-1] > senkou_a.iloc[-1] and c.iloc[-1] > senkou_b.iloc[-1])
+    ichi_bear    = bool(c.iloc[-1] < senkou_a.iloc[-1] and c.iloc[-1] < senkou_b.iloc[-1])
+    tk_cross_bull = bool(tenkan.iloc[-1] > kijun.iloc[-1] and tenkan.iloc[-2] <= kijun.iloc[-2])
+    tk_cross_bear = bool(tenkan.iloc[-1] < kijun.iloc[-1] and tenkan.iloc[-2] >= kijun.iloc[-2])
 
+    # Supertrend
     atr_m    = 3.0
     st_upper = (h+l)/2 + atr_m*atr14
     st_lower = (h+l)/2 - atr_m*atr14
-    direction = pd.Series(1, index=df.index)
+    st_dir   = pd.Series(1, index=df.index)
     for i in range(1, n):
-        if c.iloc[i] > st_upper.iloc[i-1]:   direction.iloc[i] = 1
-        elif c.iloc[i] < st_lower.iloc[i-1]: direction.iloc[i] = -1
-        else:                                  direction.iloc[i] = direction.iloc[i-1]
-    st_bull = direction.iloc[-1] == 1
+        if c.iloc[i] > st_upper.iloc[i-1]:   st_dir.iloc[i] = 1
+        elif c.iloc[i] < st_lower.iloc[i-1]: st_dir.iloc[i] = -1
+        else:                                  st_dir.iloc[i] = st_dir.iloc[i-1]
+    st_bull = bool(st_dir.iloc[-1] == 1)
 
+    # Candlestick patterns
     patterns = []
-    o1,h1,l1,c1 = df.iloc[-1][["open","high","low","close"]]
-    o2,h2,l2,c2 = df.iloc[-2][["open","high","low","close"]]
-    o3,h3,l3,c3 = df.iloc[-3][["open","high","low","close"]]
+    o1,h1,l1,c1 = float(o.iloc[-1]),float(h.iloc[-1]),float(l.iloc[-1]),float(c.iloc[-1])
+    o2,h2,l2,c2 = float(o.iloc[-2]),float(h.iloc[-2]),float(l.iloc[-2]),float(c.iloc[-2])
+    o3,h3,l3,c3 = float(o.iloc[-3]),float(h.iloc[-3]),float(l.iloc[-3]),float(c.iloc[-3])
     body1=abs(c1-o1); range1=h1-l1 if h1!=l1 else 0.0001
     body2=abs(c2-o2); body3=abs(c3-o3)
     bull1=c1>o1; bear1=c1<o1; bull2=c2>o2; bear2=c2<o2; bull3=c3>o3; bear3=c3<o3
     lw1=min(o1,c1)-l1; uw1=h1-max(o1,c1)
-    if body1 < range1*0.1:                                      patterns.append(("Doji","neutral"))
-    if lw1>body1*2 and uw1<body1*0.3:                           patterns.append(("Hammer" if bear2 else "Hanging Man","bullish" if bear2 else "bearish"))
-    if uw1>body1*2 and lw1<body1*0.3:                           patterns.append(("Shooting Star" if bull2 else "Inv. Hammer","bearish" if bull2 else "bullish"))
-    if bull1 and bear2 and c1>o2 and o1<c2:                    patterns.append(("Bullish Engulfing","bullish"))
-    if bear1 and bull2 and c1<o2 and o1>c2:                    patterns.append(("Bearish Engulfing","bearish"))
-    if bear3 and body2<(h2-l2)*0.3 and bull1 and c1>(o3+c3)/2: patterns.append(("Morning Star","bullish"))
-    if bull3 and body2<(h2-l2)*0.3 and bear1 and c1<(o3+c3)/2: patterns.append(("Evening Star","bearish"))
-    if bull1 and bull2 and bull3 and c1>c2>c3:                  patterns.append(("3 White Soldiers","bullish"))
-    if bear1 and bear2 and bear3 and c1<c2<c3:                  patterns.append(("3 Black Crows","bearish"))
-    if abs(l1-l2)<range1*0.05 and bear2 and bull1:              patterns.append(("Tweezer Bottom","bullish"))
-    if abs(h1-h2)<range1*0.05 and bull2 and bear1:              patterns.append(("Tweezer Top","bearish"))
+    if body1 < range1*0.1:                                       patterns.append(("Doji","neutral"))
+    if lw1>body1*2 and uw1<body1*0.3:                            patterns.append(("Hammer" if bear2 else "Hanging Man","bullish" if bear2 else "bearish"))
+    if uw1>body1*2 and lw1<body1*0.3:                            patterns.append(("Shooting Star" if bull2 else "Inv. Hammer","bearish" if bull2 else "bullish"))
+    if bull1 and bear2 and c1>o2 and o1<c2:                     patterns.append(("Bullish Engulfing","bullish"))
+    if bear1 and bull2 and c1<o2 and o1>c2:                     patterns.append(("Bearish Engulfing","bearish"))
+    if bear3 and body2<(h2-l2)*0.3 and bull1 and c1>(o3+c3)/2:  patterns.append(("Morning Star","bullish"))
+    if bull3 and body2<(h2-l2)*0.3 and bear1 and c1<(o3+c3)/2:  patterns.append(("Evening Star","bearish"))
+    if bull1 and bull2 and bull3 and c1>c2>c3:                   patterns.append(("3 White Soldiers","bullish"))
+    if bear1 and bear2 and bear3 and c1<c2<c3:                   patterns.append(("3 Black Crows","bearish"))
+    if abs(l1-l2)<range1*0.05 and bear2 and bull1:               patterns.append(("Tweezer Bottom","bullish"))
+    if abs(h1-h2)<range1*0.05 and bull2 and bear1:               patterns.append(("Tweezer Top","bearish"))
 
     vol_avg20 = v.rolling(20).mean().iloc[-1]
     vol_ratio = v.iloc[-1] / vol_avg20 if vol_avg20 > 0 else 1
 
     return {
-        "price": round(c.iloc[-1], 6),
-        "rsi": round(rsi.iloc[-1], 2),
-        "rsi_div": rsi_div,
-        "macd_cross": macd_cross,
-        "macd_hist": round(hist.iloc[-1], 8),
-        "hist_momentum": hist_momentum,
-        "bb_pct_b": round(bb_pct_b.iloc[-1]*100, 1),
-        "bb_squeeze": bb_squeeze,
-        "ema50": round(ema50.iloc[-1], 6),
-        "ema200": round(ema200.iloc[-1], 6),
-        "golden_cross": golden_cross,
-        "death_cross": death_cross,
-        "ema_stack_bull": ema_stack_bull,
-        "ema_stack_bear": ema_stack_bear,
-        "stoch_k": round(stoch_k.iloc[-1], 2),
-        "stoch_d": round(stoch_d.iloc[-1], 2),
-        "atr_pct": round(atr_pct, 2),
-        "obv_trend": obv_trend,
-        "price_vs_vwap": price_vs_vwap,
-        "willr": round(willr.iloc[-1], 2),
-        "cci": round(cci.iloc[-1], 2),
-        "psar_bull": psar_bull,
-        "adx": round(adx.iloc[-1], 2),
-        "trend_strength": trend_strength,
-        "ichi_bull": ichi_bull,
-        "ichi_bear": ichi_bear,
-        "tk_cross_bull": tk_cross_bull,
-        "tk_cross_bear": tk_cross_bear,
-        "st_bull": st_bull,
-        "patterns": patterns,
-        "vol_surge": vol_ratio > 1.5,
-        "vol_ratio": round(vol_ratio, 2),
+        "price": round(c.iloc[-1], 6), "rsi": round(rsi.iloc[-1], 2),
+        "rsi_div": rsi_div, "macd_cross": macd_cross,
+        "macd_hist": round(hist.iloc[-1], 8), "hist_momentum": hist_momentum,
+        "bb_pct_b": round(bb_pct_b.iloc[-1]*100, 1), "bb_squeeze": bb_squeeze,
+        "ema50": round(ema50.iloc[-1], 6), "ema200": round(ema200.iloc[-1], 6),
+        "golden_cross": golden_cross, "death_cross": death_cross,
+        "ema_stack_bull": ema_stack_bull, "ema_stack_bear": ema_stack_bear,
+        "stoch_k": round(stoch_k.iloc[-1], 2), "stoch_d": round(stoch_d.iloc[-1], 2),
+        "atr_pct": round(atr_pct, 2), "obv_trend": obv_trend,
+        "price_vs_vwap": price_vs_vwap, "willr": round(willr.iloc[-1], 2),
+        "cci": round(cci.iloc[-1], 2), "psar_bull": psar_bull,
+        "adx": round(adx.iloc[-1], 2), "trend_strength": trend_strength,
+        "ichi_bull": ichi_bull, "ichi_bear": ichi_bear,
+        "tk_cross_bull": tk_cross_bull, "tk_cross_bear": tk_cross_bear,
+        "st_bull": st_bull, "patterns": patterns,
+        "vol_surge": vol_ratio > 1.5, "vol_ratio": round(vol_ratio, 2),
     }
 
 # ── SCORING ENGINE ────────────────────────────────────────────────────────────
@@ -447,24 +632,24 @@ def score(ind: dict) -> dict:
 
     if ind["rsi"] < 30:    add(8,0,f"RSI Oversold ({ind['rsi']})")
     elif ind["rsi"] > 70:  add(0,8,f"RSI Overbought ({ind['rsi']})")
-    elif ind["rsi"] > 55:  add(3,0,f"RSI Bullish Zone")
-    elif ind["rsi"] < 45:  add(0,3,f"RSI Bearish Zone")
-    if ind["rsi_div"] == "bullish":   add(10,0,"Bullish RSI Divergence")
-    elif ind["rsi_div"] == "bearish": add(0,10,"Bearish RSI Divergence")
+    elif ind["rsi"] > 55:  add(3,0,"RSI Bullish Zone")
+    elif ind["rsi"] < 45:  add(0,3,"RSI Bearish Zone")
+    if ind["rsi_div"] == "bullish":    add(10,0,"Bullish RSI Divergence")
+    elif ind["rsi_div"] == "bearish":  add(0,10,"Bearish RSI Divergence")
     if ind["macd_cross"] == "bullish": add(7,0,"MACD Bullish Cross")
     else:                               add(0,7,"MACD Bearish Cross")
     if ind["hist_momentum"] == "accelerating":
-        if ind["macd_cross"] == "bullish": add(3,0,"MACD Momentum ↑")
-        else:                               add(0,3,"MACD Momentum ↓")
-    if ind["bb_pct_b"] < 10:   add(6,0,"BB Lower Band Touch")
-    elif ind["bb_pct_b"] > 90: add(0,6,"BB Upper Band Touch")
-    if ind["bb_squeeze"]:       add(2,2,"BB Squeeze Detected")
-    if ind["ema_stack_bull"]:   add(9,0,"Full Bullish EMA Stack")
-    elif ind["ema_stack_bear"]: add(0,9,"Full Bearish EMA Stack")
+        if ind["macd_cross"] == "bullish": add(3,0,"MACD Momentum Up")
+        else:                               add(0,3,"MACD Momentum Down")
+    if ind["bb_pct_b"] < 10:    add(6,0,"BB Lower Band Touch")
+    elif ind["bb_pct_b"] > 90:  add(0,6,"BB Upper Band Touch")
+    if ind["bb_squeeze"]:        add(2,2,"BB Squeeze")
+    if ind["ema_stack_bull"]:    add(9,0,"Full Bullish EMA Stack")
+    elif ind["ema_stack_bear"]:  add(0,9,"Full Bearish EMA Stack")
     elif ind["ema50"] > ind["ema200"]: add(4,0,"EMA50 > EMA200")
-    else:                              add(0,4,"EMA50 < EMA200")
-    if ind["golden_cross"]: add(12,0,"🌟 Golden Cross")
-    if ind["death_cross"]:  add(0,12,"💀 Death Cross")
+    else:                               add(0,4,"EMA50 < EMA200")
+    if ind["golden_cross"]: add(12,0,"Golden Cross")
+    if ind["death_cross"]:  add(0,12,"Death Cross")
     if ind["stoch_k"] < 20 and ind["stoch_k"] > ind["stoch_d"]: add(6,0,"Stoch RSI Oversold Cross")
     elif ind["stoch_k"] > 80 and ind["stoch_k"] < ind["stoch_d"]: add(0,6,"Stoch RSI Overbought Cross")
     if ind["obv_trend"] == "bullish": add(5,0,"OBV Bullish")
@@ -484,99 +669,67 @@ def score(ind: dict) -> dict:
     if ind["st_bull"]: add(7,0,"Supertrend Bullish")
     else:               add(0,7,"Supertrend Bearish")
     for name, bias in ind["patterns"]:
-        if bias == "bullish":   add(6,0,f"Pattern: {name}")
+        if bias == "bullish":  add(6,0,f"Pattern: {name}")
         elif bias == "bearish": add(0,6,f"Pattern: {name}")
     if ind["vol_surge"]:
-        if b > br: add(4,0,f"Volume Surge ({ind['vol_ratio']}x)")
-        else:       add(0,4,f"Volume Surge ({ind['vol_ratio']}x)")
+        if b > br: add(4,0,f"Volume Surge {ind['vol_ratio']}x")
+        else:       add(0,4,f"Volume Surge {ind['vol_ratio']}x")
 
     adx_mult = 1.2 if ind["trend_strength"] == "Strong" else 0.9
-    total    = b + br
+    total = b + br
     if total == 0:
         return {"direction":"NEUTRAL","confidence":50,"signal":"HOLD","risk":"MEDIUM",
                 "bull_signals":[],"bear_signals":[],"bull_score":0,"bear_score":0}
-    net      = (b - br) * adx_mult
-    conf     = min(85, max(50, round(50 + (abs(net)/(total*adx_mult))*45)))
-    direction= "UP" if net > 0 else "DOWN" if net < 0 else "NEUTRAL"
-    signal   = "BUY" if direction=="UP" and conf>=65 else \
-               "SELL" if direction=="DOWN" and conf>=65 else "HOLD"
-    risk     = "HIGH" if ind["atr_pct"]>3 else "MEDIUM" if ind["atr_pct"]>1.5 else "LOW"
-
+    net       = (b - br) * adx_mult
+    conf      = min(85, max(50, round(50 + (abs(net)/(total*adx_mult))*45)))
+    direction = "UP" if net > 0 else "DOWN" if net < 0 else "NEUTRAL"
+    signal    = "BUY" if direction=="UP" and conf>=65 else \
+                "SELL" if direction=="DOWN" and conf>=65 else "HOLD"
+    risk      = "HIGH" if ind["atr_pct"]>3 else "MEDIUM" if ind["atr_pct"]>1.5 else "LOW"
     return {
-        "direction":    direction,
-        "confidence":   conf,
-        "signal":       signal,
-        "risk":         risk,
+        "direction": direction, "confidence": conf, "signal": signal, "risk": risk,
         "bull_signals": [s for s in sigs if s.startswith("✅")][:5],
         "bear_signals": [s for s in sigs if s.startswith("❌")][:5],
-        "bull_score":   round(b),
-        "bear_score":   round(br),
+        "bull_score": round(b), "bear_score": round(br),
     }
 
-# ── FORMAT ANALYSIS ───────────────────────────────────────────────────────────
-
-# ── GROK AI ANALYSIS ──────────────────────────────────────────────────────────
-async def get_grok_analysis(symbol: str, ind: dict, pred: dict) -> str:
-    """Call Grok API for AI-powered analysis with X/Twitter sentiment"""
-    try:
-        prompt = f"""You are an expert crypto analyst. Analyze {symbol}/USDT and provide a sharp, confident 3-4 sentence analysis.
-
-Technical data:
-- Price: {ind['price']}
-- RSI: {ind['rsi']} ({'Overbought' if ind['rsi']>70 else 'Oversold' if ind['rsi']<30 else 'Neutral'})
-- MACD: {ind['macd_cross']} crossover
-- EMA Trend: {'Bullish stack' if ind['ema_stack_bull'] else 'Bearish stack' if ind['ema_stack_bear'] else 'Mixed'}
-- Ichimoku: {'Above cloud' if ind['ichi_bull'] else 'Below cloud' if ind['ichi_bear'] else 'Inside cloud'}
-- Supertrend: {'Bullish' if ind['st_bull'] else 'Bearish'}
-- Volume: {ind['vol_ratio']}x average {'(surge)' if ind['vol_surge'] else ''}
-- Signal: {pred['signal']} with {pred['confidence']}% confidence
-- Patterns: {', '.join([p[0] for p in ind['patterns']]) if ind['patterns'] else 'None'}
-
-Also check current X/Twitter sentiment for {symbol} crypto. What are people saying?
-
-Respond in exactly this format (no extra text):
-SENTIMENT: [Bullish/Bearish/Neutral] (X/Twitter sentiment score X/10)
-ANALYSIS: [3-4 sentences combining technicals + X sentiment]
-KEY_LEVEL: [Most important price level to watch]
-OUTLOOK: [One line short-term outlook]"""
-
-        r = requests.post(
-            "https://api.x.ai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROK_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "grok-3-fast",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 300,
-                "temperature": 0.7
-            },
-            timeout=15
-        )
-        result = r.json()
-        return result["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        logger.error(f"Grok error: {e}")
-        return None
+# ── GROK AI ───────────────────────────────────────────────────────────────────
+async def get_grok_analysis(symbol: str, ind: dict, pred: dict) -> str | None:
+    prompt = (
+        f"You are an expert crypto analyst. Analyze {symbol}/USDT and provide a sharp, "
+        f"confident 3-4 sentence analysis.\n\n"
+        f"Technical data:\n"
+        f"- Price: {ind['price']}\n"
+        f"- RSI: {ind['rsi']} ({'Overbought' if ind['rsi']>70 else 'Oversold' if ind['rsi']<30 else 'Neutral'})\n"
+        f"- MACD: {ind['macd_cross']} crossover\n"
+        f"- EMA Trend: {'Bullish stack' if ind['ema_stack_bull'] else 'Bearish stack' if ind['ema_stack_bear'] else 'Mixed'}\n"
+        f"- Ichimoku: {'Above cloud' if ind['ichi_bull'] else 'Below cloud' if ind['ichi_bear'] else 'Inside cloud'}\n"
+        f"- Supertrend: {'Bullish' if ind['st_bull'] else 'Bearish'}\n"
+        f"- Volume: {ind['vol_ratio']}x average {'(surge)' if ind['vol_surge'] else ''}\n"
+        f"- Signal: {pred['signal']} with {pred['confidence']}% confidence\n"
+        f"- Patterns: {', '.join([p[0] for p in ind['patterns']]) if ind['patterns'] else 'None'}\n\n"
+        f"Also check current X/Twitter sentiment for {symbol} crypto.\n\n"
+        f"Respond in exactly this format:\n"
+        f"SENTIMENT: [Bullish/Bearish/Neutral] (X/Twitter sentiment score X/10)\n"
+        f"ANALYSIS: [3-4 sentences]\n"
+        f"KEY_LEVEL: [Most important price level]\n"
+        f"OUTLOOK: [One line short-term outlook]"
+    )
+    return await call_grok(prompt)
 
 def format_grok_section(grok_text: str) -> str:
-    """Parse and format Grok response into clean message"""
     if not grok_text:
         return ""
-    lines = {}
+    parsed = {}
     for line in grok_text.strip().splitlines():
         if ":" in line:
             k, v = line.split(":", 1)
-            lines[k.strip()] = v.strip()
-
-    sentiment  = lines.get("SENTIMENT", "").replace("*","").replace("_","").replace("`","")
-    analysis   = lines.get("ANALYSIS", "").replace("*","").replace("_","").replace("`","")
-    key_level  = lines.get("KEY_LEVEL", "").replace("*","").replace("_","").replace("`","")
-    outlook    = lines.get("OUTLOOK", "").replace("*","").replace("_","").replace("`","")
-
-    sent_e = "🟢" if "Bullish" in sentiment else "🔴" if "Bearish" in sentiment else "🟡"
-
+            parsed[k.strip()] = v.strip().replace("*","").replace("_","").replace("`","")
+    sentiment = parsed.get("SENTIMENT", "")
+    analysis  = parsed.get("ANALYSIS", "")
+    key_level = parsed.get("KEY_LEVEL", "")
+    outlook   = parsed.get("OUTLOOK", "")
+    sent_e    = "🟢" if "Bullish" in sentiment else "🔴" if "Bearish" in sentiment else "🟡"
     return (
         f"\n{DIVIDER}\n"
         f"🤖 GROK AI + X SENTIMENT\n"
@@ -592,11 +745,12 @@ def format_analysis(symbol, tf_label, ind, pred, premium=False, grok_text=None) 
     sig_e  = "🟢" if pred["signal"]=="BUY" else "🔴" if pred["signal"]=="SELL" else "🟡"
     risk_e = "🟢" if pred["risk"]=="LOW" else "🟡" if pred["risk"]=="MEDIUM" else "🔴"
     bar    = "█"*(pred["confidence"]//10) + "░"*(10-pred["confidence"]//10)
-    rsi_s  = "🔥 Overbought" if ind["rsi"]>70 else "🧊 Oversold" if ind["rsi"]<30 else "✅ Neutral"
+    rsi_s  = "Overbought" if ind["rsi"]>70 else "Oversold" if ind["rsi"]<30 else "Neutral"
     pats   = ", ".join([p[0] for p in ind["patterns"]]) if ind["patterns"] else "None"
     bulls  = "\n".join(pred["bull_signals"]) or "  —"
     bears  = "\n".join(pred["bear_signals"]) or "  —"
     tier   = "⭐ PREMIUM" if premium else "🆓 FREE"
+
     grok_section = ""
     if premium and grok_text:
         grok_section = format_grok_section(grok_text)
@@ -606,7 +760,7 @@ def format_analysis(symbol, tf_label, ind, pred, premium=False, grok_text=None) 
             "🤖 GROK AI + X SENTIMENT\n"
             "🔒 Premium Feature\n"
             "Upgrade to unlock AI analysis\n"
-            "and live X/Twitter sentiment!\n"
+            f"and live X/Twitter sentiment!\n"
             f"{DIVIDER}"
         )
 
@@ -637,10 +791,10 @@ def format_analysis(symbol, tf_label, ind, pred, premium=False, grok_text=None) 
 └────────────────────────────────
 
 ┌─── 📐 KEY INDICATORS ──────────
-│ RSI(14):     `{ind['rsi']}` {rsi_s}
+│ RSI(14):     `{ind['rsi']}` — {rsi_s}
 │ Stoch RSI:   `K={ind['stoch_k']} / D={ind['stoch_d']}`
 │ MACD:        `{ind['macd_cross'].capitalize()}` ({ind['hist_momentum']})
-│ BB %B:       `{ind['bb_pct_b']}%`{'  🔲 Squeeze!' if ind['bb_squeeze'] else ''}
+│ BB %B:       `{ind['bb_pct_b']}%`{'  Squeeze!' if ind['bb_squeeze'] else ''}
 │ Williams %R: `{ind['willr']}`
 │ CCI:         `{ind['cci']:.1f}`
 │ ATR:         `{ind['atr_pct']}%`
@@ -658,31 +812,29 @@ def format_analysis(symbol, tf_label, ind, pred, premium=False, grok_text=None) 
 
 🕯️ *Patterns:* _{pats}_
 {grok_section}
-
 {DIVIDER}
 ⚠️ _Not financial advice. DYOR._
 💹 _Trade on BingX:_ [Join Here]({BINGX_LINK}) `{BINGX_CODE}`
 """.strip()
 
 # ── KEYBOARDS ─────────────────────────────────────────────────────────────────
-def main_menu_kb(uid: str):
-    premium = is_premium(uid)
+def main_menu_kb(premium: bool):
     tier_btn = "⭐ Premium Active" if premium else "🔓 Upgrade to Premium"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Analyze Coin",     callback_data="menu_analyze"),
-         InlineKeyboardButton("🌍 Market Overview",  callback_data="menu_market")],
-        [InlineKeyboardButton("📈 Top Movers",        callback_data="menu_movers"),
-         InlineKeyboardButton("😨 Fear & Greed",     callback_data="menu_fg")],
-        [InlineKeyboardButton("⭐ Watchlist",         callback_data="menu_watchlist"),
-         InlineKeyboardButton("🚨 Price Alerts",     callback_data="menu_alerts")],
-        [InlineKeyboardButton("💼 Portfolio",         callback_data="menu_portfolio"),
-         InlineKeyboardButton("📰 Crypto News",      callback_data="menu_news")],
-        [InlineKeyboardButton("🔍 Coin Info",         callback_data="menu_coininfo"),
-         InlineKeyboardButton("🏅 Leaderboard",      callback_data="menu_leaderboard")],
-        [InlineKeyboardButton("👥 Refer & Earn",      callback_data="menu_referral"),
-         InlineKeyboardButton("⚙️ Settings",         callback_data="menu_settings")],
-        [InlineKeyboardButton(f"💎 {tier_btn}",       callback_data="menu_premium")],
-        [InlineKeyboardButton("🏦 Exchanges",         callback_data="menu_exchanges")],
+        [InlineKeyboardButton("📊 Analyze Coin",       callback_data="menu_analyze"),
+         InlineKeyboardButton("🌍 Market Overview",    callback_data="menu_market")],
+        [InlineKeyboardButton("📈 Top Movers",          callback_data="menu_movers"),
+         InlineKeyboardButton("😨 Fear & Greed",       callback_data="menu_fg")],
+        [InlineKeyboardButton("⭐ Watchlist",           callback_data="menu_watchlist"),
+         InlineKeyboardButton("🚨 Price Alerts",       callback_data="menu_alerts")],
+        [InlineKeyboardButton("💼 Portfolio",           callback_data="menu_portfolio"),
+         InlineKeyboardButton("📰 Crypto News",        callback_data="menu_news")],
+        [InlineKeyboardButton("🔍 Coin Info",           callback_data="menu_coininfo"),
+         InlineKeyboardButton("🏅 Leaderboard",        callback_data="menu_leaderboard")],
+        [InlineKeyboardButton("👥 Refer & Earn",        callback_data="menu_referral"),
+         InlineKeyboardButton("⚙️ Settings",           callback_data="menu_settings")],
+        [InlineKeyboardButton(f"💎 {tier_btn}",         callback_data="menu_premium")],
+        [InlineKeyboardButton("🏦 Exchanges",           callback_data="menu_exchanges")],
         [InlineKeyboardButton("📣 Join Our Channel 🚀", url=CHANNEL_LINK)],
     ])
 
@@ -692,8 +844,7 @@ def coin_select_kb(action="analyze"):
     rows.append([InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")])
     return InlineKeyboardMarkup(rows)
 
-def timeframe_kb(symbol: str, uid: str):
-    premium = is_premium(uid)
+def timeframe_kb(symbol: str, premium: bool):
     if premium:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("⏱ 1H", callback_data=f"tf|{symbol}|1h"),
@@ -701,170 +852,135 @@ def timeframe_kb(symbol: str, uid: str):
              InlineKeyboardButton("📅 1D", callback_data=f"tf|{symbol}|1d")],
             [InlineKeyboardButton("🔙 Back", callback_data="menu_analyze")],
         ])
-    else:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("📅 1D (Free)", callback_data=f"tf|{symbol}|1d"),
-             InlineKeyboardButton("⏱ 1H 🔒", callback_data="upgrade_prompt"),
-             InlineKeyboardButton("⏱ 4H 🔒", callback_data="upgrade_prompt")],
-            [InlineKeyboardButton("🔙 Back", callback_data="menu_analyze")],
-        ])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 1D (Free)", callback_data=f"tf|{symbol}|1d"),
+         InlineKeyboardButton("⏱ 1H 🔒",    callback_data="upgrade_prompt"),
+         InlineKeyboardButton("⏱ 4H 🔒",    callback_data="upgrade_prompt")],
+        [InlineKeyboardButton("🔙 Back", callback_data="menu_analyze")],
+    ])
 
 def back_kb():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")]])
 
 def premium_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⭐ Monthly — 500 Stars", callback_data="buy_monthly")],
+        [InlineKeyboardButton("⭐ Monthly — 500 Stars",  callback_data="buy_monthly")],
         [InlineKeyboardButton("💎 Lifetime — 2500 Stars", callback_data="buy_lifetime")],
-        [InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")],
+        [InlineKeyboardButton("🏠 Main Menu",             callback_data="menu_main")],
     ])
 
-# ── HANDLERS ──────────────────────────────────────────────────────────────────
+# ── START ─────────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid      = str(update.effective_user.id)
     name     = update.effective_user.first_name or "Trader"
     username = update.effective_user.username or ""
-    user     = get_user(uid)
-    user["username"] = username
-    update_user(uid, user)
+    user     = await get_user(uid)
+    await update_user(uid, username=username)
 
-    # Handle referral
     args = context.args
-    if args and args[0].startswith("REF") and not user.get("referred_by"):
-        ref_code = args[0]
-        data = load_data()
-        for rid, ruser in data.items():
-            if ruser.get("referral_code") == ref_code and rid != uid:
-                user["referred_by"] = rid
-                ruser.setdefault("referrals", []).append(uid)
-                update_user(rid, ruser)
-                break
-        update_user(uid, user)
+    if args and args[0].startswith("REF") and not user["referred_by"]:
+        async with aiosqlite.connect(DB_FILE) as db:
+            async with db.execute(
+                "SELECT uid FROM users WHERE referral_code=?", (args[0],)
+            ) as cur:
+                row = await cur.fetchone()
+        if row and row[0] != uid:
+            await update_user(uid, referred_by=row[0])
+            await add_referral(row[0], uid)
 
-    premium = is_premium(uid)
+    premium = await is_premium(uid)
     tier    = "⭐ Premium" if premium else "🆓 Free"
 
     await update.message.reply_text(
-        f"{LOGO}\n"
-        f"{DIVIDER}\n"
+        f"{LOGO}\n{DIVIDER}\n"
         f"👋 *Welcome, {name}!*\n\n"
-        f"Your professional crypto analysis assistant.\n"
-        f"Powered by *15+ indicators* & real-time data.\n\n"
-        f"📊 Current Plan: *{tier}*\n"
-        f"🔑 Your Referral Code: `{user['referral_code']}`\n\n"
-        f"📣 Join our channel: {CHANNEL_LINK}\n\n"
+        f"Professional crypto analysis powered by *15+ indicators* & Grok AI.\n\n"
+        f"📊 Plan: *{tier}*\n"
+        f"🔑 Referral Code: `{user['referral_code']}`\n"
+        f"📣 Channel: {CHANNEL_LINK}\n\n"
         f"Select an option below 👇",
-        reply_markup=main_menu_kb(uid),
+        reply_markup=main_menu_kb(premium),
         parse_mode="Markdown"
     )
 
+# ── MAIN CALLBACK HANDLER ─────────────────────────────────────────────────────
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+    query   = update.callback_query
     await query.answer()
-    data  = query.data
-    uid   = str(query.from_user.id)
-    user  = get_user(uid)
-    premium = is_premium(uid)
+    data    = query.data
+    uid     = str(query.from_user.id)
+    premium = await is_premium(uid)
 
     # ── MAIN MENU ──
     if data == "menu_main":
         await query.edit_message_text(
-            f"{LOGO}\n{DIVIDER}\n\n"
-            f"📊 Plan: *{'⭐ Premium' if premium else '🆓 Free'}*\n\n"
-            "Select an option 👇",
-            reply_markup=main_menu_kb(uid),
-            parse_mode="Markdown"
+            f"{LOGO}\n{DIVIDER}\n\n📊 Plan: *{'⭐ Premium' if premium else '🆓 Free'}*\n\nSelect an option 👇",
+            reply_markup=main_menu_kb(premium), parse_mode="Markdown"
         )
 
     # ── ANALYZE ──
     elif data == "menu_analyze":
-        can, remaining = check_daily_limit(uid)
+        can, remaining = await check_daily_limit(uid)
         if not can:
             await query.edit_message_text(
-                f"{LOGO}\n{DIVIDER}\n\n"
-                "⚠️ *Daily limit reached!*\n\n"
-                f"Free users get *{FREE_ANALYSES_PER_DAY} analyses/day*.\n"
-                "Upgrade to Premium for *unlimited* analysis! 🚀",
-                reply_markup=premium_kb(),
-                parse_mode="Markdown"
+                f"{LOGO}\n{DIVIDER}\n\n⚠️ *Daily limit reached!*\n\n"
+                f"Free users get *{FREE_ANALYSES_PER_DAY} analyses/day*.\nUpgrade for unlimited! 🚀",
+                reply_markup=premium_kb(), parse_mode="Markdown"
             )
             return
-        limit_text = "" if premium else f"\n_({remaining} analyses remaining today)_"
-        coins_text = "Any coin" if premium else "BTC & ETH only (Free)"
+        limit_text = "" if premium else f"\n_({remaining} remaining today)_"
         await query.edit_message_text(
-            f"{LOGO}\n{DIVIDER}\n\n"
-            f"📊 *Analyze a Coin*\n"
-            f"🪙 Available: _{coins_text}_\n"
-            f"{limit_text}\n\n"
-            "Select a coin or search:",
-            reply_markup=coin_select_kb("analyze"),
-            parse_mode="Markdown"
+            f"{LOGO}\n{DIVIDER}\n\n📊 *Analyze a Coin*\n"
+            f"🪙 _{'Any coin' if premium else 'BTC & ETH only (Free)'}_{limit_text}\n\nSelect a coin:",
+            reply_markup=coin_select_kb("analyze"), parse_mode="Markdown"
         )
 
     elif data.startswith("analyze_coin|"):
         symbol = data.split("|")[1]
         if not premium and symbol not in FREE_COINS:
             await query.edit_message_text(
-                f"{LOGO}\n{DIVIDER}\n\n"
-                f"🔒 *{symbol} is Premium only*\n\n"
-                "Free users can analyze BTC & ETH.\n"
-                "Upgrade to analyze *any coin!* 🚀",
-                reply_markup=premium_kb(),
-                parse_mode="Markdown"
+                f"{LOGO}\n{DIVIDER}\n\n🔒 *{symbol} is Premium only*\n\n"
+                "Upgrade to analyze any coin! 🚀",
+                reply_markup=premium_kb(), parse_mode="Markdown"
             )
             return
         await query.edit_message_text(
             f"🪙 *{symbol}/USDT* — Select timeframe:",
-            reply_markup=timeframe_kb(symbol, uid),
-            parse_mode="Markdown"
+            reply_markup=timeframe_kb(symbol, premium), parse_mode="Markdown"
         )
 
     elif data == "analyze_search":
         context.user_data["action"] = "analyze"
         await query.edit_message_text(
-            f"{LOGO}\n{DIVIDER}\n\n"
-            "🔍 *Search Any Coin*\n\n"
-            "Type the coin symbol:\n"
-            "_(e.g. PEPE, AVAX, LINK, DOT)_",
+            f"{LOGO}\n{DIVIDER}\n\n🔍 *Search Any Coin*\n\nType the symbol:\n_(e.g. PEPE, AVAX, LINK)_",
             parse_mode="Markdown"
         )
 
     elif data == "upgrade_prompt":
         await query.edit_message_text(
-            f"{LOGO}\n{DIVIDER}\n\n"
-            "🔒 *Premium Feature*\n\n"
-            "1H and 4H timeframes are available for Premium users.\n\n"
-            "Upgrade now to unlock:\n"
-            "• All timeframes (1H, 4H, 1D)\n"
-            "• Any coin analysis\n"
-            "• Unlimited daily analyses\n"
-            "• Price alerts & watchlist\n"
-            "• And much more! 🚀",
-            reply_markup=premium_kb(),
-            parse_mode="Markdown"
+            f"{LOGO}\n{DIVIDER}\n\n🔒 *Premium Feature*\n\n"
+            "Upgrade to unlock all timeframes, any coin, and Grok AI! 🚀",
+            reply_markup=premium_kb(), parse_mode="Markdown"
         )
 
     elif data.startswith("tf|"):
         _, symbol, tf = data.split("|")
         if not premium and tf != "1d":
             await query.edit_message_text(
-                f"🔒 *{tf.upper()} timeframe is Premium only*",
-                reply_markup=premium_kb(),
-                parse_mode="Markdown"
+                f"🔒 *{tf.upper()} is Premium only*",
+                reply_markup=premium_kb(), parse_mode="Markdown"
             )
             return
         tf_labels = {"1h": "1 Hour", "4h": "4 Hours", "1d": "1 Day"}
         tf_label  = tf_labels.get(tf, tf)
         await query.edit_message_text(
-            f"⏳ Analyzing *{symbol}/USDT* on {tf_label}...\n"
-            "_Running 15+ indicators_ 📊",
+            f"⏳ Analyzing *{symbol}/USDT* on {tf_label}...\n_Running 15+ indicators_ 📊",
             parse_mode="Markdown"
         )
-        df = fetch_ohlcv(symbol, tf)
+        df = await fetch_ohlcv(symbol, tf)
         if df is None or len(df) < 60:
             await query.edit_message_text(
-                f"❌ *{symbol}/USDT* not found.\nCheck the symbol and try again.",
-                reply_markup=back_kb(), parse_mode="Markdown"
+                f"❌ *{symbol}/USDT* not found.", reply_markup=back_kb(), parse_mode="Markdown"
             )
             return
         ind  = compute_all(df)
@@ -872,68 +988,57 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         grok_text = None
         if premium:
             await query.edit_message_text(
-                f"⏳ Running Grok AI analysis for *{symbol}/USDT*...\n"
-                "_Checking X sentiment + technicals_ 🤖",
+                f"⏳ Running Grok AI for *{symbol}*...\n_Checking X sentiment_ 🤖",
                 parse_mode="Markdown"
             )
             grok_text = await get_grok_analysis(symbol, ind, pred)
-        msg  = format_analysis(symbol, tf_label, ind, pred, premium, grok_text)
-        increment_analysis(uid)
+        msg = format_analysis(symbol, tf_label, ind, pred, premium, grok_text)
+        await increment_analysis(uid)
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Refresh", callback_data=f"tf|{symbol}|{tf}"),
+            [InlineKeyboardButton("🔄 Refresh",  callback_data=f"tf|{symbol}|{tf}"),
              InlineKeyboardButton("⭐ Watchlist", callback_data=f"wl_add|{symbol}")],
             [InlineKeyboardButton("🔍 Coin Info", callback_data=f"coininfo|{symbol}"),
-             InlineKeyboardButton("🏠 Menu", callback_data="menu_main")],
+             InlineKeyboardButton("🏠 Menu",      callback_data="menu_main")],
         ])
         await query.edit_message_text(msg, reply_markup=kb, parse_mode="Markdown", disable_web_page_preview=True)
 
     # ── MARKET OVERVIEW ──
     elif data == "menu_market":
         await query.edit_message_text("⏳ Fetching market data...", parse_mode="Markdown")
-        fg   = fetch_fear_greed()
-        fg_e = "🟢" if fg["value"] >= 60 else "🔴" if fg["value"] <= 40 else "🟡"
-        lines = [
-            f"{LOGO}\n{DIVIDER}",
-            f"🌍 *Market Overview*\n",
-            f"{fg_e} Fear & Greed: *{fg['value']}/100* — _{fg['label']}_\n",
-            f"{DIVIDER}",
-        ]
+        fg    = await fetch_fear_greed()
+        fg_e  = "🟢" if fg["value"] >= 60 else "🔴" if fg["value"] <= 40 else "🟡"
+        lines = [f"{LOGO}\n{DIVIDER}", f"🌍 *Market Overview*\n",
+                 f"{fg_e} Fear & Greed: *{fg['value']}/100* — _{fg['label']}_\n", DIVIDER]
         for coin in TOP_COINS:
-            d = fetch_24h(coin)
+            d = await fetch_24h(coin)
             if d:
                 e = "📈" if d["change"] >= 0 else "📉"
                 lines.append(f"{e} *{coin}:* `${d['price']:,.4f}` `{d['change']:+.2f}%`")
-        lines.append(f"\n{DIVIDER}")
-        lines.append("_Powered by KuCoin • Real-time data_")
-        await query.edit_message_text(
-            "\n".join(lines), reply_markup=back_kb(), parse_mode="Markdown"
-        )
+        lines.append(f"\n{DIVIDER}\n_Powered by KuCoin_")
+        await query.edit_message_text("\n".join(lines), reply_markup=back_kb(), parse_mode="Markdown")
 
     # ── TOP MOVERS ──
     elif data == "menu_movers":
         await query.edit_message_text("⏳ Fetching top movers...", parse_mode="Markdown")
-        movers = fetch_top_movers()
+        movers = await fetch_top_movers()
         lines  = [f"{LOGO}\n{DIVIDER}", "📈 *TOP GAINERS (24H)*\n"]
         for i, t in enumerate(movers["gainers"], 1):
-            sym  = t["symbol"].replace("-USDT","")
-            chg  = float(t.get("changeRate", 0)) * 100
-            price= float(t.get("last", 0))
+            sym   = t["symbol"].replace("-USDT","")
+            chg   = float(t.get("changeRate", 0)) * 100
+            price = float(t.get("last", 0))
             lines.append(f"`{i}.` 🟢 *{sym}* `+{chg:.2f}%` — `${price:,.6f}`")
-        lines.append(f"\n{DIVIDER}")
-        lines.append("📉 *TOP LOSERS (24H)*\n")
+        lines.append(f"\n{DIVIDER}\n📉 *TOP LOSERS (24H)*\n")
         for i, t in enumerate(movers["losers"], 1):
-            sym  = t["symbol"].replace("-USDT","")
-            chg  = float(t.get("changeRate", 0)) * 100
-            price= float(t.get("last", 0))
+            sym   = t["symbol"].replace("-USDT","")
+            chg   = float(t.get("changeRate", 0)) * 100
+            price = float(t.get("last", 0))
             lines.append(f"`{i}.` 🔴 *{sym}* `{chg:.2f}%` — `${price:,.6f}`")
         lines.append(f"\n{DIVIDER}\n_Source: KuCoin_")
-        await query.edit_message_text(
-            "\n".join(lines), reply_markup=back_kb(), parse_mode="Markdown"
-        )
+        await query.edit_message_text("\n".join(lines), reply_markup=back_kb(), parse_mode="Markdown")
 
     # ── FEAR & GREED ──
     elif data == "menu_fg":
-        fg  = fetch_fear_greed()
+        fg  = await fetch_fear_greed()
         val = fg["value"]
         if val >= 75:   e,desc = "🤑","Extreme Greed — Market may be overheated"
         elif val >= 55: e,desc = "😀","Greed — Bullish sentiment dominates"
@@ -942,54 +1047,42 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:           e,desc = "😱","Extreme Fear — Potential buying opportunity"
         bar = "█"*(val//10) + "░"*(10-val//10)
         await query.edit_message_text(
-            f"{LOGO}\n{DIVIDER}\n\n"
-            f"😨 *Fear & Greed Index*\n\n"
-            f"{e} *{val}/100* — _{fg['label']}_\n\n"
-            f"`{bar}`\n\n"
-            f"📝 _{desc}_\n\n"
-            f"_0 = Extreme Fear  |  100 = Extreme Greed_\n"
-            f"_Source: alternative.me_",
+            f"{LOGO}\n{DIVIDER}\n\n😨 *Fear & Greed Index*\n\n"
+            f"{e} *{val}/100* — _{fg['label']}_\n\n`{bar}`\n\n_{desc}_\n\n"
+            f"_0 = Extreme Fear  |  100 = Extreme Greed_",
             reply_markup=back_kb(), parse_mode="Markdown"
         )
 
     # ── WATCHLIST ──
     elif data == "menu_watchlist":
-        wl = user.get("watchlist", [])
+        wl = await get_watchlist(uid)
         if not wl:
             await query.edit_message_text(
-                f"{LOGO}\n{DIVIDER}\n\n"
-                "⭐ *My Watchlist*\n\nEmpty! Analyze a coin and tap ⭐ to add it.",
+                f"{LOGO}\n{DIVIDER}\n\n⭐ *My Watchlist*\n\nEmpty! Analyze a coin and tap ⭐ to add.",
                 reply_markup=back_kb(), parse_mode="Markdown"
             )
             return
         buttons = [
             [InlineKeyboardButton(f"📊 {c}", callback_data=f"analyze_coin|{c}"),
-             InlineKeyboardButton(f"🗑 Remove", callback_data=f"wl_remove|{c}")]
+             InlineKeyboardButton("🗑 Remove", callback_data=f"wl_remove|{c}")]
             for c in wl
         ]
         buttons.append([InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")])
         await query.edit_message_text(
-            f"{LOGO}\n{DIVIDER}\n\n"
-            f"⭐ *My Watchlist* — {len(wl)} coins\n\nTap 📊 to analyze or 🗑 to remove:",
+            f"{LOGO}\n{DIVIDER}\n\n⭐ *My Watchlist* — {len(wl)} coins\n\nTap 📊 to analyze:",
             reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown"
         )
 
     elif data.startswith("wl_add|"):
         symbol = data.split("|")[1]
-        if symbol not in user["watchlist"]:
-            user["watchlist"].append(symbol)
-            update_user(uid, user)
-            await query.answer(f"⭐ {symbol} added to watchlist!")
-        else:
-            await query.answer(f"{symbol} already in watchlist.")
+        await add_watchlist(uid, symbol)
+        await query.answer(f"⭐ {symbol} added to watchlist!")
 
     elif data.startswith("wl_remove|"):
         symbol = data.split("|")[1]
-        if symbol in user["watchlist"]:
-            user["watchlist"].remove(symbol)
-            update_user(uid, user)
+        await remove_watchlist(uid, symbol)
         await query.answer(f"🗑 {symbol} removed.")
-        wl = get_user(uid).get("watchlist", [])
+        wl = await get_watchlist(uid)
         if not wl:
             await query.edit_message_text(
                 f"{LOGO}\n{DIVIDER}\n\n⭐ *Watchlist is empty.*",
@@ -998,7 +1091,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             buttons = [
                 [InlineKeyboardButton(f"📊 {c}", callback_data=f"analyze_coin|{c}"),
-                 InlineKeyboardButton(f"🗑 Remove", callback_data=f"wl_remove|{c}")]
+                 InlineKeyboardButton("🗑 Remove", callback_data=f"wl_remove|{c}")]
                 for c in wl
             ]
             buttons.append([InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")])
@@ -1009,32 +1102,27 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── PRICE ALERTS ──
     elif data == "menu_alerts":
-        alerts  = user.get("alerts", [])
-        premium = is_premium(uid)
+        alerts     = await get_alerts(uid)
         max_alerts = 10 if premium else 2
-        buttons = []
-        for i, a in enumerate(alerts):
+        buttons    = []
+        for a in alerts:
             e = "📈" if a["direction"] == "above" else "📉"
             buttons.append([
                 InlineKeyboardButton(
                     f"{e} {a['symbol']} {a['direction']} ${a['target']:,.2f}",
-                    callback_data=f"alert_info|{i}"
+                    callback_data=f"alert_info|{a['id']}"
                 ),
-                InlineKeyboardButton("🗑", callback_data=f"alert_del|{i}")
+                InlineKeyboardButton("🗑", callback_data=f"alert_del|{a['id']}")
             ])
         if len(alerts) < max_alerts:
             buttons.append([InlineKeyboardButton("➕ New Alert", callback_data="alert_new")])
         buttons.append([InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")])
-        limit_text = f"{len(alerts)}/{max_alerts} alerts used"
-        tier_text  = "Premium: 10 alerts" if premium else "Free: 2 alerts max — Upgrade for 10"
+        tier_text = "Premium: 10 alerts" if premium else "Free: 2 max — Upgrade for 10"
         await query.edit_message_text(
-            f"{LOGO}\n{DIVIDER}\n\n"
-            f"🚨 Price Alerts\n\n"
-            f"{limit_text}\n"
-            f"{tier_text}\n\n"
-            f"{'Tap an alert to view or 🗑 to delete' if alerts else 'No alerts yet — tap + New Alert to add one!'}",
-            reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode="Markdown"
+            f"{LOGO}\n{DIVIDER}\n\n🚨 *Price Alerts*\n\n"
+            f"{len(alerts)}/{max_alerts} alerts used\n_{tier_text}_\n\n"
+            f"{'Tap 🗑 to delete' if alerts else 'No alerts — tap + New Alert!'}",
+            reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown"
         )
 
     elif data == "alert_new":
@@ -1042,17 +1130,14 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows.append([InlineKeyboardButton("🔍 Other Coin", callback_data="alert_search")])
         rows.append([InlineKeyboardButton("🔙 Back", callback_data="menu_alerts")])
         await query.edit_message_text(
-            f"{LOGO}\n{DIVIDER}\n\n"
-            "🚨 *New Alert*\n\nStep 1: Select a coin:",
-            reply_markup=InlineKeyboardMarkup(rows),
-            parse_mode="Markdown"
+            f"{LOGO}\n{DIVIDER}\n\n🚨 *New Alert*\n\nStep 1: Select a coin:",
+            reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown"
         )
 
     elif data == "alert_search":
         context.user_data["action"] = "alert_search"
         await query.edit_message_text(
-            f"{LOGO}\n{DIVIDER}\n\n"
-            "🔍 Type the coin symbol:\n_(e.g. PEPE, AVAX, LINK)_",
+            f"{LOGO}\n{DIVIDER}\n\n🔍 Type the coin symbol:\n_(e.g. PEPE, AVAX, LINK)_",
             parse_mode="Markdown"
         )
 
@@ -1060,9 +1145,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         symbol = data.split("|")[1]
         context.user_data["alert_symbol"] = symbol
         await query.edit_message_text(
-            f"{LOGO}\n{DIVIDER}\n\n"
-            f"🚨 *New Alert — {symbol}*\n\n"
-            "Step 2: Select direction:",
+            f"{LOGO}\n{DIVIDER}\n\n🚨 *New Alert — {symbol}*\n\nStep 2: Select direction:",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📈 Price Goes Above", callback_data=f"alert_dir|{symbol}|above")],
                 [InlineKeyboardButton("📉 Price Goes Below", callback_data=f"alert_dir|{symbol}|below")],
@@ -1076,112 +1159,101 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["alert_symbol"]    = symbol
         context.user_data["alert_direction"] = direction
         context.user_data["action"]          = "alert_price"
-        price = fetch_price(symbol)
-        price_hint = f"Current price: ${price:,.4f}" if price else ""
+        price = await fetch_price(symbol)
+        price_hint = f"Current price: `${price:,.4f}`" if price else ""
         e = "📈" if direction == "above" else "📉"
         await query.edit_message_text(
-            f"{LOGO}\n{DIVIDER}\n\n"
-            f"🚨 *New Alert — {symbol}*\n\n"
-            f"{e} Alert when price goes *{direction}*\n"
-            f"{price_hint}\n\n"
+            f"{LOGO}\n{DIVIDER}\n\n🚨 *New Alert — {symbol}*\n\n"
+            f"{e} Trigger when price goes *{direction}*\n{price_hint}\n\n"
             "Step 3: Type the target price:\n_(just the number, e.g. 70000)_",
             parse_mode="Markdown"
         )
 
     elif data.startswith("alert_del|"):
-        idx    = int(data.split("|")[1])
-        alerts = user.get("alerts", [])
-        if 0 <= idx < len(alerts):
-            removed = alerts.pop(idx)
-            user["alerts"] = alerts
-            update_user(uid, user)
-            await query.answer(f"🗑 Alert deleted!")
-        # Refresh alerts menu
-        alerts  = user.get("alerts", [])
-        premium = is_premium(uid)
+        alert_id = int(data.split("|")[1])
+        await delete_alert(alert_id)
+        await query.answer("🗑 Alert deleted!")
+        alerts     = await get_alerts(uid)
         max_alerts = 10 if premium else 2
-        buttons = []
-        for i, a in enumerate(alerts):
+        buttons    = []
+        for a in alerts:
             e = "📈" if a["direction"] == "above" else "📉"
             buttons.append([
                 InlineKeyboardButton(
                     f"{e} {a['symbol']} {a['direction']} ${a['target']:,.2f}",
-                    callback_data=f"alert_info|{i}"
+                    callback_data=f"alert_info|{a['id']}"
                 ),
-                InlineKeyboardButton("🗑", callback_data=f"alert_del|{i}")
+                InlineKeyboardButton("🗑", callback_data=f"alert_del|{a['id']}")
             ])
         if len(alerts) < max_alerts:
             buttons.append([InlineKeyboardButton("➕ New Alert", callback_data="alert_new")])
         buttons.append([InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")])
         await query.edit_message_text(
-            f"{LOGO}\n{DIVIDER}\n\n"
-            f"🚨 Price Alerts\n\n"
-            f"{len(alerts)}/{max_alerts} alerts used\n\n"
+            f"{LOGO}\n{DIVIDER}\n\n🚨 *Price Alerts*\n\n"
+            f"{len(alerts)}/{max_alerts} used\n\n"
             f"{'Tap 🗑 to delete' if alerts else 'No alerts — tap + New Alert!'}",
-            reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode="Markdown"
+            reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown"
         )
 
     elif data.startswith("alert_info|"):
-        idx    = int(data.split("|")[1])
-        alerts = user.get("alerts", [])
-        if 0 <= idx < len(alerts):
-            a  = alerts[idx]
-            e  = "📈" if a["direction"] == "above" else "📉"
-            p  = fetch_price(a["symbol"])
-            current = f"${p:,.4f}" if p else "N/A"
-            await query.edit_message_text(
-                f"{LOGO}\n{DIVIDER}\n\n"
-                f"🚨 *Alert Details*\n\n"
-                f"🪙 Coin: *{a['symbol']}*\n"
-                f"{e} Trigger: *{a['direction']}* `${a['target']:,.2f}`\n"
-                f"💰 Current Price: `{current}`\n\n"
-                f"{'📈 Price is above target!' if p and p >= a['target'] and a['direction']=='above' else '📉 Price is below target!' if p and p <= a['target'] and a['direction']=='below' else '⏳ Waiting for target...'}",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🗑 Delete Alert", callback_data=f"alert_del|{idx}")],
-                    [InlineKeyboardButton("🔙 Back", callback_data="menu_alerts")],
-                ]),
-                parse_mode="Markdown"
-            )
+        alert_id = int(data.split("|")[1])
+        alerts   = await get_alerts(uid)
+        a        = next((x for x in alerts if x["id"] == alert_id), None)
+        if not a:
+            await query.answer("Alert not found."); return
+        e = "📈" if a["direction"] == "above" else "📉"
+        p = await fetch_price(a["symbol"])
+        current = f"${p:,.4f}" if p else "N/A"
+        status  = "⏳ Waiting..." if not p else \
+                  ("✅ Target reached!" if (a["direction"]=="above" and p>=a["target"]) or
+                   (a["direction"]=="below" and p<=a["target"]) else "⏳ Waiting...")
+        await query.edit_message_text(
+            f"{LOGO}\n{DIVIDER}\n\n🚨 *Alert Details*\n\n"
+            f"🪙 Coin: *{a['symbol']}*\n"
+            f"{e} Trigger: *{a['direction']}* `${a['target']:,.2f}`\n"
+            f"💰 Current Price: `{current}`\n"
+            f"Status: {status}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 Delete Alert", callback_data=f"alert_del|{alert_id}")],
+                [InlineKeyboardButton("🔙 Back", callback_data="menu_alerts")],
+            ]),
+            parse_mode="Markdown"
+        )
 
     # ── PORTFOLIO ──
     elif data == "menu_portfolio":
-        portfolio = user.get("portfolio", {})
+        portfolio = await get_portfolio(uid)
         if not portfolio:
             await query.edit_message_text(
-                f"{LOGO}\n{DIVIDER}\n\n"
-                "💼 *Portfolio Tracker*\n\n"
-                "Empty! Add coins with:\n"
-                "`/add BTC 0.5 42000`\n"
-                "_(symbol, amount, buy price)_",
+                f"{LOGO}\n{DIVIDER}\n\n💼 *Portfolio Tracker*\n\n"
+                "Empty! Add coins with:\n`/add BTC 0.5 42000`\n_(symbol, amount, buy price)_",
                 reply_markup=back_kb(), parse_mode="Markdown"
             )
             return
         await query.edit_message_text("⏳ Calculating portfolio...", parse_mode="Markdown")
-        total_invested = 0
-        total_current  = 0
+        total_invested = 0; total_current = 0
         lines = [f"{LOGO}\n{DIVIDER}", "💼 *My Portfolio*\n"]
-        for sym, holding in portfolio.items():
-            price = fetch_price(sym)
-            if price is None:
-                continue
-            invested = holding["amount"] * holding["buy_price"]
-            current  = holding["amount"] * price
+        for h in portfolio:
+            price = await fetch_price(h["symbol"])
+            if price is None: continue
+            invested = h["amount"] * h["buy_price"]
+            current  = h["amount"] * price
             pnl      = current - invested
             pnl_pct  = (pnl / invested * 100) if invested else 0
             pnl_e    = "📈" if pnl >= 0 else "📉"
-            total_invested += invested
-            total_current  += current
+            total_invested += invested; total_current += current
             lines.append(
-                f"{pnl_e} *{sym}:* `{holding['amount']}` @ `${holding['buy_price']:,.4f}`\n"
+                f"{pnl_e} *{h['symbol']}:* `{h['amount']}` @ `${h['buy_price']:,.4f}`\n"
                 f"   Now: `${price:,.4f}` | PnL: `{pnl_pct:+.2f}%` (`${pnl:+.2f}`)"
             )
         total_pnl     = total_current - total_invested
         total_pnl_pct = (total_pnl / total_invested * 100) if total_invested else 0
-        lines.append(f"\n{DIVIDER}")
-        lines.append(f"💰 *Total Invested:* `${total_invested:,.2f}`")
-        lines.append(f"💎 *Current Value:*  `${total_current:,.2f}`")
-        lines.append(f"{'📈' if total_pnl>=0 else '📉'} *Total PnL:* `{total_pnl_pct:+.2f}%` (`${total_pnl:+.2f}`)")
+        lines += [
+            f"\n{DIVIDER}",
+            f"💰 *Invested:* `${total_invested:,.2f}`",
+            f"💎 *Current:*  `${total_current:,.2f}`",
+            f"{'📈' if total_pnl>=0 else '📉'} *PnL:* `{total_pnl_pct:+.2f}%` (`${total_pnl:+.2f}`)"
+        ]
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🗑 Clear Portfolio", callback_data="portfolio_clear")],
             [InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")],
@@ -1189,8 +1261,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("\n".join(lines), reply_markup=kb, parse_mode="Markdown")
 
     elif data == "portfolio_clear":
-        user["portfolio"] = {}
-        update_user(uid, user)
+        await clear_portfolio(uid)
         await query.edit_message_text(
             f"{LOGO}\n{DIVIDER}\n\n💼 Portfolio cleared!",
             reply_markup=back_kb(), parse_mode="Markdown"
@@ -1199,65 +1270,44 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── NEWS ──
     elif data == "menu_news":
         await query.edit_message_text("⏳ Fetching latest news...", parse_mode="Markdown")
-        news = fetch_news()
+        news = await fetch_news()
         if not news:
-            await query.edit_message_text(
-                "📰 Could not fetch news. Try again later.",
-                reply_markup=back_kb(), parse_mode="Markdown"
-            )
+            await query.edit_message_text("📰 Could not fetch news.", reply_markup=back_kb(), parse_mode="Markdown")
             return
         msg = f"{LOGO}\n{DIVIDER}\n\n📰 *Latest Crypto News*\n\n"
         for i, n in enumerate(news, 1):
-            msg += f"*{i}. {n['title']}*\n_{n['source']}_ — [Read →]({n['url']})\n\n"
-        await query.edit_message_text(
-            msg, reply_markup=back_kb(), parse_mode="Markdown", disable_web_page_preview=True
-        )
+            msg += f"*{i}. {n['title']}*\n_{n['source']}_ — [Read]({n['url']})\n\n"
+        await query.edit_message_text(msg, reply_markup=back_kb(), parse_mode="Markdown", disable_web_page_preview=True)
 
     # ── COIN INFO ──
     elif data == "menu_coininfo":
         context.user_data["action"] = "coininfo"
         await query.edit_message_text(
-            f"{LOGO}\n{DIVIDER}\n\n"
-            "🔍 *Coin Fundamentals*\n\n"
-            "Type a coin symbol:\n_(e.g. BTC, ETH, SOL, DOGE)_",
+            f"{LOGO}\n{DIVIDER}\n\n🔍 *Coin Fundamentals*\n\nType a coin symbol:\n_(e.g. BTC, ETH, SOL)_",
             parse_mode="Markdown"
         )
 
     elif data.startswith("coininfo|"):
         symbol = data.split("|")[1]
         await query.edit_message_text(f"⏳ Fetching {symbol} info...", parse_mode="Markdown")
-        info = fetch_coin_info(symbol)
+        info = await fetch_coin_info(symbol)
         if not info:
-            await query.edit_message_text(
-                f"❌ Could not fetch info for *{symbol}*.",
-                reply_markup=back_kb(), parse_mode="Markdown"
-            )
+            await query.edit_message_text(f"❌ Could not fetch *{symbol}*.", reply_markup=back_kb(), parse_mode="Markdown")
             return
-        mc  = info["market_cap"]
-        vol = info["volume_24h"]
+        mc  = info["market_cap"]; vol = info["volume_24h"]
         mc_str  = f"${mc/1e9:.2f}B" if mc > 1e9 else f"${mc/1e6:.2f}M"
         vol_str = f"${vol/1e9:.2f}B" if vol > 1e9 else f"${vol/1e6:.2f}M"
-        sup_str = f"{info['supply']:,.0f}" if info['supply'] else "N/A"
-        max_str = f"{info['max_supply']:,.0f}" if info['max_supply'] else "∞"
         msg = (
-            f"{LOGO}\n{DIVIDER}\n\n"
-            f"🔍 *{info['name']} ({info['symbol']})*\n"
-            f"📊 Rank: *#{info['rank']}*\n\n"
-            f"{DIVIDER}\n"
-            f"💰 *Price:*        `${info['price']:,.6f}`\n"
-            f"📈 *24h Change:*   `{info['change_24h']:+.2f}%`\n"
-            f"📅 *7d Change:*    `{info['change_7d']:+.2f}%`\n"
-            f"🗓 *30d Change:*   `{info['change_30d']:+.2f}%`\n\n"
-            f"{DIVIDER}\n"
-            f"💎 *Market Cap:*   `{mc_str}`\n"
-            f"📦 *Volume 24H:*   `{vol_str}`\n"
-            f"🔄 *Circulating:*  `{sup_str}`\n"
-            f"🏁 *Max Supply:*   `{max_str}`\n\n"
-            f"{DIVIDER}\n"
-            f"🏆 *ATH:* `${info['ath']:,.4f}` `({info['ath_change']:+.1f}% from ATH)`\n\n"
-            f"_{info['description'][:200]}..._\n\n"
-            f"{DIVIDER}\n"
-            f"_Source: CoinGecko_"
+            f"{LOGO}\n{DIVIDER}\n\n🔍 *{info['name']} ({info['symbol']})*\n"
+            f"📊 Rank: *#{info['rank']}*\n\n{DIVIDER}\n"
+            f"💰 *Price:*       `${info['price']:,.6f}`\n"
+            f"📈 *24h Change:*  `{info['change_24h']:+.2f}%`\n"
+            f"📅 *7d Change:*   `{info['change_7d']:+.2f}%`\n"
+            f"🗓 *30d Change:*  `{info['change_30d']:+.2f}%`\n\n{DIVIDER}\n"
+            f"💎 *Market Cap:*  `{mc_str}`\n"
+            f"📦 *Volume 24H:* `{vol_str}`\n"
+            f"🏆 *ATH:* `${info['ath']:,.4f}` `({info['ath_change']:+.1f}%)`\n\n{DIVIDER}\n"
+            f"_{info['description'][:200]}..._"
         )
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("📊 Analyze", callback_data=f"analyze_coin|{symbol}"),
@@ -1268,39 +1318,43 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── LEADERBOARD ──
     elif data == "menu_leaderboard":
-        all_data = load_data()
-        sorted_users = sorted(
-            all_data.items(),
-            key=lambda x: x[1].get("total_analyses", 0),
-            reverse=True
-        )[:10]
-        lines = [f"{LOGO}\n{DIVIDER}", "🏅 *Leaderboard — Top Analysts*\n"]
-        medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
-        for i, (lid, luser) in enumerate(sorted_users):
-            name     = luser.get("username") or f"User{lid[-4:]}"
-            analyses = luser.get("total_analyses", 0)
-            tier_e   = "⭐" if is_premium(lid) else "🆓"
-            lines.append(f"{medals[i]} {tier_e} *@{name}* — `{analyses}` analyses")
-        user_rank = next((i+1 for i,(lid,_) in enumerate(sorted(all_data.items(), key=lambda x: x[1].get("total_analyses",0), reverse=True)) if lid==uid), "N/A")
-        lines.append(f"\n{DIVIDER}\n📍 *Your Rank:* #{user_rank} with `{user.get('total_analyses',0)}` analyses")
-        await query.edit_message_text(
-            "\n".join(lines), reply_markup=back_kb(), parse_mode="Markdown"
-        )
+        async with aiosqlite.connect(DB_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT uid, username, total_analyses, premium, premium_type, premium_expiry "
+                "FROM users ORDER BY total_analyses DESC LIMIT 10"
+            ) as cur:
+                top = [dict(r) for r in await cur.fetchall()]
+            async with db.execute(
+                "SELECT COUNT(*) FROM users WHERE uid<?", (uid,)
+            ) as cur:
+                pass
+            async with db.execute(
+                "SELECT uid FROM users ORDER BY total_analyses DESC"
+            ) as cur:
+                all_uids = [r[0] for r in await cur.fetchall()]
+        user_row = await get_user(uid)
+        rank     = all_uids.index(uid) + 1 if uid in all_uids else "N/A"
+        medals   = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+        lines    = [f"{LOGO}\n{DIVIDER}", "🏅 *Leaderboard — Top Analysts*\n"]
+        for i, u in enumerate(top):
+            name    = u.get("username") or f"User{u['uid'][-4:]}"
+            tier_e  = "⭐" if u["premium"] else "🆓"
+            lines.append(f"{medals[i]} {tier_e} *@{name}* — `{u['total_analyses']}` analyses")
+        lines.append(f"\n{DIVIDER}\n📍 *Your Rank:* #{rank} with `{user_row['total_analyses']}` analyses")
+        await query.edit_message_text("\n".join(lines), reply_markup=back_kb(), parse_mode="Markdown")
 
     # ── REFERRAL ──
     elif data == "menu_referral":
-        ref_code  = user.get("referral_code", f"REF{uid[-6:]}")
-        referrals = user.get("referrals", [])
+        user      = await get_user(uid)
+        ref_code  = user["referral_code"]
+        referrals = await get_referrals(uid)
         bot_info  = await context.bot.get_me()
-        bot_username = bot_info.username
-        ref_link  = f"https://t.me/{bot_username}?start={ref_code}"
+        ref_link  = f"https://t.me/{bot_info.username}?start={ref_code}"
         await query.edit_message_text(
-            f"{LOGO}\n{DIVIDER}\n\n"
-            f"👥 *Refer & Earn*\n\n"
-            f"Share your link and earn rewards!\n\n"
+            f"{LOGO}\n{DIVIDER}\n\n👥 *Refer & Earn*\n\n"
             f"🔗 *Your Link:*\n`{ref_link}`\n\n"
-            f"👥 *Total Referrals:* `{len(referrals)}`\n\n"
-            f"{DIVIDER}\n"
+            f"👥 *Total Referrals:* `{len(referrals)}`\n\n{DIVIDER}\n"
             f"🎁 *Rewards:*\n"
             f"• 5 referrals = 1 week Premium FREE\n"
             f"• 20 referrals = 1 month Premium FREE\n"
@@ -1311,36 +1365,33 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── SETTINGS ──
     elif data == "menu_settings":
-        signal_time    = user.get("signal_time", "09:00")
-        signal_enabled = user.get("signal_enabled", True)
+        user = await get_user(uid)
+        signal_time    = user["signal_time"]
+        signal_enabled = bool(user["signal_enabled"])
         await query.edit_message_text(
-            f"{LOGO}\n{DIVIDER}\n\n"
-            f"⚙️ *Settings*\n\n"
+            f"{LOGO}\n{DIVIDER}\n\n⚙️ *Settings*\n\n"
             f"📅 Daily Signal Time: `{signal_time} UTC`\n"
-            f"🔔 Daily Signals: `{'ON ✅' if signal_enabled else 'OFF ❌'}`\n\n"
-            f"{DIVIDER}\n"
-            f"📌 *Commands:*\n"
+            f"🔔 Daily Signals: `{'ON' if signal_enabled else 'OFF'}`\n\n{DIVIDER}\n"
             f"`/settime 08:00` — Change signal time\n"
-            f"`/signals on` — Enable signals\n"
-            f"`/signals off` — Disable signals",
+            f"`/signals on` or `/signals off` — Toggle",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔔 Toggle Signals", callback_data="toggle_signals")],
-                [InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")],
+                [InlineKeyboardButton("🏠 Main Menu",       callback_data="menu_main")],
             ]),
             parse_mode="Markdown"
         )
 
     elif data == "toggle_signals":
-        user["signal_enabled"] = not user.get("signal_enabled", True)
-        update_user(uid, user)
-        status = "ON ✅" if user["signal_enabled"] else "OFF ❌"
+        user    = await get_user(uid)
+        new_val = 0 if user["signal_enabled"] else 1
+        await update_user(uid, signal_enabled=new_val)
+        status = "ON" if new_val else "OFF"
         await query.answer(f"Daily signals: {status}")
         await query.edit_message_text(
-            f"{LOGO}\n{DIVIDER}\n\n⚙️ *Settings*\n\n"
-            f"🔔 Daily Signals: `{status}`",
+            f"{LOGO}\n{DIVIDER}\n\n⚙️ *Settings*\n\n🔔 Daily Signals: `{status}`",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔔 Toggle Signals", callback_data="toggle_signals")],
-                [InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")],
+                [InlineKeyboardButton("🏠 Main Menu",       callback_data="menu_main")],
             ]),
             parse_mode="Markdown"
         )
@@ -1348,40 +1399,25 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── PREMIUM ──
     elif data == "menu_premium":
         if premium:
-            ptype  = user.get("premium_type","")
-            expiry = user.get("premium_expiry","")
-            exp_str= "Never (Lifetime)" if ptype=="lifetime" else expiry[:10] if expiry else "N/A"
+            user    = await get_user(uid)
+            ptype   = user.get("premium_type","")
+            expiry  = user.get("premium_expiry","")
+            exp_str = "Never (Lifetime)" if ptype=="lifetime" else expiry[:10] if expiry else "N/A"
             await query.edit_message_text(
-                f"{LOGO}\n{DIVIDER}\n\n"
-                f"⭐ *Premium Active!*\n\n"
-                f"Plan: *{ptype.capitalize()}*\n"
-                f"Expires: `{exp_str}`\n\n"
-                f"✅ All features unlocked!\n"
-                f"✅ Unlimited analyses\n"
-                f"✅ All timeframes\n"
-                f"✅ Any coin\n"
-                f"✅ Priority support",
+                f"{LOGO}\n{DIVIDER}\n\n⭐ *Premium Active!*\n\n"
+                f"Plan: *{ptype.capitalize()}*\nExpires: `{exp_str}`\n\n"
+                "✅ All features unlocked!",
                 reply_markup=back_kb(), parse_mode="Markdown"
             )
         else:
             await query.edit_message_text(
-                f"{LOGO}\n{DIVIDER}\n\n"
-                f"💎 *Upgrade to Premium*\n\n"
-                f"🆓 *Free Plan:*\n"
-                f"• BTC & ETH only\n"
-                f"• 1D timeframe only\n"
-                f"• 3 analyses/day\n\n"
-                f"⭐ *Premium Plan:*\n"
-                f"• Any coin on KuCoin\n"
-                f"• All timeframes (1H/4H/1D)\n"
-                f"• Unlimited analyses\n"
-                f"• Price alerts\n"
-                f"• Full watchlist\n"
-                f"• Daily auto signals\n"
-                f"• Priority support\n\n"
+                f"{LOGO}\n{DIVIDER}\n\n💎 *Upgrade to Premium*\n\n"
+                f"🆓 *Free:* BTC & ETH only, 1D only, 3/day\n\n"
+                f"⭐ *Premium:*\n• Any coin\n• All timeframes\n• Unlimited analyses\n"
+                f"• Grok AI + X sentiment\n• Alerts & Watchlist\n• Daily signals\n\n"
                 f"{DIVIDER}\n"
-                f"💰 *Monthly:* 500 ⭐ Stars (~$4.99)\n"
-                f"💎 *Lifetime:* 2500 ⭐ Stars (~$29.99)",
+                f"💰 *Monthly:* 500 ⭐ (~$4.99)\n"
+                f"💎 *Lifetime:* 2500 ⭐ (~$29.99)",
                 reply_markup=premium_kb(), parse_mode="Markdown"
             )
 
@@ -1389,9 +1425,8 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_invoice(
             chat_id=query.message.chat_id,
             title="⭐ Atomic Crypto Premium — Monthly",
-            description="Unlock all features: any coin, all timeframes, unlimited analyses, alerts & more!",
-            payload="premium_monthly",
-            currency="XTR",
+            description="Unlock all features: any coin, all timeframes, Grok AI, unlimited analyses!",
+            payload="premium_monthly", currency="XTR",
             prices=[LabeledPrice("Monthly Premium", PREMIUM_MONTHLY_STARS)],
         )
 
@@ -1399,17 +1434,15 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_invoice(
             chat_id=query.message.chat_id,
             title="💎 Atomic Crypto Premium — Lifetime",
-            description="One-time payment. Unlock everything forever — all coins, timeframes, signals & more!",
-            payload="premium_lifetime",
-            currency="XTR",
+            description="One-time payment. Unlock everything forever!",
+            payload="premium_lifetime", currency="XTR",
             prices=[LabeledPrice("Lifetime Premium", PREMIUM_LIFETIME_STARS)],
         )
 
     # ── EXCHANGES ──
     elif data == "menu_exchanges":
         await query.edit_message_text(
-            f"{LOGO}\n{DIVIDER}\n\n"
-            f"🏦 *Recommended Exchanges*\n\n"
+            f"{LOGO}\n{DIVIDER}\n\n🏦 *Recommended Exchanges*\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"⚡ *BingX* — Best for India & Pakistan\n"
             f"🎁 Get trading rewards on signup!\n"
@@ -1426,100 +1459,43 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── PAYMENT HANDLERS ──────────────────────────────────────────────────────────
 async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.pre_checkout_query
-    await query.answer(ok=True)
+    await update.pre_checkout_query.answer(ok=True)
 
 async def payment_success(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid     = str(update.effective_user.id)
-    user    = get_user(uid)
     payload = update.message.successful_payment.invoice_payload
-    from datetime import timedelta
-
     if payload == "premium_monthly":
-        from datetime import timedelta
-        expiry = datetime.now(timezone.utc) + timedelta(days=30)
-        user["premium"]        = True
-        user["premium_type"]   = "monthly"
-        user["premium_expiry"] = expiry.isoformat()
-        update_user(uid, user)
+        expiry = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+        await update_user(uid, premium=1, premium_type="monthly", premium_expiry=expiry)
         await update.message.reply_text(
-            f"{LOGO}\n{DIVIDER}\n\n"
-            "🎉 *Payment Successful!*\n\n"
-            "⭐ *Premium Monthly activated!*\n"
-            "Valid for 30 days.\n\n"
-            "All features are now unlocked! 🚀",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Go to Menu", callback_data="menu_main")]]),
+            f"{LOGO}\n{DIVIDER}\n\n🎉 *Payment Successful!*\n\n"
+            "⭐ *Premium Monthly activated!* Valid for 30 days.\n\nAll features unlocked! 🚀",
             parse_mode="Markdown"
         )
     elif payload == "premium_lifetime":
-        user["premium"]        = True
-        user["premium_type"]   = "lifetime"
-        user["premium_expiry"] = None
-        update_user(uid, user)
+        await update_user(uid, premium=1, premium_type="lifetime", premium_expiry="")
         await update.message.reply_text(
-            f"{LOGO}\n{DIVIDER}\n\n"
-            "🎉 *Payment Successful!*\n\n"
-            "💎 *Lifetime Premium activated!*\n"
-            "All features unlocked *forever!* 🚀\n\n"
-            "Thank you for supporting Atomic Crypto! ❤️",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Go to Menu", callback_data="menu_main")]]),
+            f"{LOGO}\n{DIVIDER}\n\n🎉 *Payment Successful!*\n\n"
+            "💎 *Lifetime Premium activated forever!* Thank you! ❤️",
             parse_mode="Markdown"
         )
 
 # ── COMMANDS ──────────────────────────────────────────────────────────────────
-async def alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid  = str(update.effective_user.id)
-    args = context.args
-    if len(args) != 3 or args[1] not in ("above","below"):
-        await update.message.reply_text(
-            "⚠️ Usage: `/alert BTC above 70000`\nor `/alert ETH below 3000`",
-            parse_mode="Markdown"
-        )
-        return
-    symbol, direction = args[0].upper(), args[1]
-    try:
-        target = float(args[2])
-    except:
-        await update.message.reply_text("⚠️ Invalid price.", parse_mode="Markdown")
-        return
-    user = get_user(uid)
-    user["alerts"].append({
-        "symbol": clean_symbol(symbol),
-        "direction": direction,
-        "target": target,
-        "chat_id": update.effective_chat.id
-    })
-    update_user(uid, user)
-    e = "📈" if direction == "above" else "📉"
-    await update.message.reply_text(
-        f"✅ *Alert Set!*\n\n{e} *{clean_symbol(symbol)}* {direction} `${target:,.2f}`\n"
-        "_I'll notify you when triggered!_",
-        parse_mode="Markdown"
-    )
-
 async def add_portfolio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = str(update.effective_user.id)
     args = context.args
     if len(args) != 3:
-        await update.message.reply_text(
-            "⚠️ Usage: `/add BTC 0.5 42000`\n_(symbol, amount, buy price)_",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("Usage: `/add BTC 0.5 42000`", parse_mode="Markdown")
         return
     symbol = clean_symbol(args[0])
     try:
-        amount    = float(args[1])
-        buy_price = float(args[2])
-    except:
+        amount = float(args[1]); buy_price = float(args[2])
+    except ValueError:
         await update.message.reply_text("⚠️ Invalid amount or price.", parse_mode="Markdown")
         return
-    user = get_user(uid)
-    user["portfolio"][symbol] = {"amount": amount, "buy_price": buy_price}
-    update_user(uid, user)
+    await upsert_portfolio(uid, symbol, amount, buy_price)
     await update.message.reply_text(
-        f"✅ *Portfolio Updated!*\n\n"
-        f"💼 *{symbol}:* `{amount}` @ `${buy_price:,.4f}`\n\n"
-        "_View portfolio from main menu_ 📊",
+        f"✅ *Portfolio Updated!*\n\n💼 *{symbol}:* `{amount}` @ `${buy_price:,.4f}`",
         parse_mode="Markdown"
     )
 
@@ -1527,25 +1503,16 @@ async def settime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = str(update.effective_user.id)
     args = context.args
     if not args:
-        await update.message.reply_text(
-            "⚠️ Usage: `/settime 08:00`\n_(UTC time for daily signals)_",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("Usage: `/settime 08:00`", parse_mode="Markdown")
         return
-    time_str = args[0]
     try:
-        h, m = map(int, time_str.split(":"))
+        h, m = map(int, args[0].split(":"))
         assert 0 <= h <= 23 and 0 <= m <= 59
-    except:
+    except (ValueError, AssertionError):
         await update.message.reply_text("⚠️ Invalid time. Use format: `08:30`", parse_mode="Markdown")
         return
-    user = get_user(uid)
-    user["signal_time"] = f"{h:02d}:{m:02d}"
-    update_user(uid, user)
-    await update.message.reply_text(
-        f"✅ Daily signal time set to `{h:02d}:{m:02d} UTC`",
-        parse_mode="Markdown"
-    )
+    await update_user(uid, signal_time=f"{h:02d}:{m:02d}")
+    await update.message.reply_text(f"✅ Signal time set to `{h:02d}:{m:02d} UTC`", parse_mode="Markdown")
 
 async def signals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = str(update.effective_user.id)
@@ -1553,35 +1520,29 @@ async def signals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not args or args[0] not in ("on","off"):
         await update.message.reply_text("Usage: `/signals on` or `/signals off`", parse_mode="Markdown")
         return
-    user = get_user(uid)
-    user["signal_enabled"] = args[0] == "on"
-    update_user(uid, user)
-    await update.message.reply_text(
-        f"✅ Daily signals: `{'ON' if user['signal_enabled'] else 'OFF'}`",
-        parse_mode="Markdown"
-    )
+    val = 1 if args[0] == "on" else 0
+    await update_user(uid, signal_enabled=val)
+    await update.message.reply_text(f"✅ Daily signals: `{'ON' if val else 'OFF'}`", parse_mode="Markdown")
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid    = str(update.effective_user.id)
     action = context.user_data.get("action")
     text   = update.message.text.upper().strip()
+    premium = await is_premium(uid)
 
     if action == "analyze":
-        symbol = text.replace("USDT","").replace("/","")
+        symbol = clean_symbol(text)
         context.user_data["action"] = None
         await update.message.reply_text(
             f"🪙 *{symbol}/USDT* — Select timeframe:",
-            reply_markup=timeframe_kb(symbol, uid),
-            parse_mode="Markdown"
+            reply_markup=timeframe_kb(symbol, premium), parse_mode="Markdown"
         )
     elif action == "alert_search":
-        symbol = text.replace("USDT","").replace("/","")
-        context.user_data["action"]       = None
+        symbol = clean_symbol(text)
+        context.user_data["action"] = None
         context.user_data["alert_symbol"] = symbol
         await update.message.reply_text(
-            f"{LOGO}\n{DIVIDER}\n\n"
-            f"🚨 *New Alert — {symbol}*\n\n"
-            "Select direction:",
+            f"{LOGO}\n{DIVIDER}\n\n🚨 *New Alert — {symbol}*\n\nSelect direction:",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📈 Price Goes Above", callback_data=f"alert_dir|{symbol}|above")],
                 [InlineKeyboardButton("📉 Price Goes Below", callback_data=f"alert_dir|{symbol}|below")],
@@ -1590,40 +1551,29 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
     elif action == "alert_price":
-        symbol    = context.user_data.get("alert_symbol", "")
-        direction = context.user_data.get("alert_direction", "")
+        symbol    = context.user_data.get("alert_symbol","")
+        direction = context.user_data.get("alert_direction","")
         context.user_data["action"] = None
         try:
             target = float(text.replace(",","").replace("$",""))
-        except:
-            await update.message.reply_text(
-                "⚠️ Invalid price. Please type just the number e.g. `70000`",
-                parse_mode="Markdown"
-            )
+        except ValueError:
+            await update.message.reply_text("⚠️ Invalid price. Type just the number e.g. `70000`", parse_mode="Markdown")
             return
-        user    = get_user(uid)
-        premium = is_premium(uid)
         max_alerts = 10 if premium else 2
-        if len(user.get("alerts",[])) >= max_alerts:
+        alerts     = await get_alerts(uid)
+        if len(alerts) >= max_alerts:
             await update.message.reply_text(
                 f"⚠️ Alert limit reached ({max_alerts}).\n"
-                f"{'Delete an alert first.' if premium else 'Upgrade to Premium for 10 alerts!'}",
+                f"{'Delete one first.' if premium else 'Upgrade for 10 alerts!'}",
                 parse_mode="Markdown"
             )
             return
-        user["alerts"].append({
-            "symbol":    clean_symbol(symbol),
-            "direction": direction,
-            "target":    target,
-            "chat_id":   update.effective_chat.id
-        })
-        update_user(uid, user)
+        await add_alert(uid, clean_symbol(symbol), direction, target, update.effective_chat.id)
         e = "📈" if direction == "above" else "📉"
         await update.message.reply_text(
-            f"{LOGO}\n{DIVIDER}\n\n"
-            f"✅ *Alert Set!*\n\n"
+            f"{LOGO}\n{DIVIDER}\n\n✅ *Alert Set!*\n\n"
             f"{e} *{clean_symbol(symbol)}* {direction} `${target:,.2f}`\n\n"
-            f"I'll notify you the moment it triggers! 🔔",
+            "I'll notify you the moment it triggers! 🔔",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ Add Another", callback_data="alert_new")],
                 [InlineKeyboardButton("🏠 Main Menu",   callback_data="menu_main")],
@@ -1631,23 +1581,18 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
     elif action == "coininfo":
-        symbol = text.replace("USDT","").replace("/","")
+        symbol = clean_symbol(text)
         context.user_data["action"] = None
         await update.message.reply_text(f"⏳ Fetching *{symbol}* info...", parse_mode="Markdown")
-        info = fetch_coin_info(symbol)
+        info = await fetch_coin_info(symbol)
         if not info:
-            await update.message.reply_text(
-                f"❌ Could not find *{symbol}*. Check the symbol.",
-                parse_mode="Markdown"
-            )
+            await update.message.reply_text(f"❌ Could not find *{symbol}*.", parse_mode="Markdown")
             return
-        mc  = info["market_cap"]
-        vol = info["volume_24h"]
+        mc  = info["market_cap"]; vol = info["volume_24h"]
         mc_str  = f"${mc/1e9:.2f}B" if mc > 1e9 else f"${mc/1e6:.2f}M"
         vol_str = f"${vol/1e9:.2f}B" if vol > 1e9 else f"${vol/1e6:.2f}M"
         msg = (
-            f"{LOGO}\n{DIVIDER}\n\n"
-            f"🔍 *{info['name']} ({info['symbol']})*\n"
+            f"{LOGO}\n{DIVIDER}\n\n🔍 *{info['name']} ({info['symbol']})*\n"
             f"📊 Rank: *#{info['rank']}*\n\n"
             f"💰 Price: `${info['price']:,.6f}`\n"
             f"📈 24h: `{info['change_24h']:+.2f}%`\n"
@@ -1659,98 +1604,84 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("📊 Analyze", callback_data=f"analyze_coin|{symbol}"),
-             InlineKeyboardButton("🏠 Menu", callback_data="menu_main")],
+             InlineKeyboardButton("🏠 Menu",    callback_data="menu_main")],
         ])
         await update.message.reply_text(msg, reply_markup=kb, parse_mode="Markdown")
     else:
         await update.message.reply_text(
             f"{LOGO}\n\nUse the menu below 👇",
-            reply_markup=main_menu_kb(uid),
-            parse_mode="Markdown"
+            reply_markup=main_menu_kb(premium), parse_mode="Markdown"
         )
 
 # ── ADMIN COMMANDS ────────────────────────────────────────────────────────────
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = str(update.effective_user.id)
-    if int(uid) != ADMIN_ID:
-        await update.message.reply_text("❌ Unauthorized.")
-        return
-    all_data  = load_data()
-    total     = len(all_data)
-    premiums  = sum(1 for u in all_data.values() if is_premium(str(list(all_data.keys())[list(all_data.values()).index(u)])))
-    free      = total - premiums
-    analyses  = sum(u.get("total_analyses", 0) for u in all_data.values())
-    referrals = sum(len(u.get("referrals", [])) for u in all_data.values())
-
+    if update.effective_user.id != ADMIN_ID: return
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as cur:
+            total = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM users WHERE premium=1") as cur:
+            premiums = (await cur.fetchone())[0]
+        async with db.execute("SELECT SUM(total_analyses) FROM users") as cur:
+            analyses = (await cur.fetchone())[0] or 0
+        async with db.execute("SELECT COUNT(*) FROM referrals") as cur:
+            referrals = (await cur.fetchone())[0]
     await update.message.reply_text(
-        f"{LOGO}\n{DIVIDER}\n\n"
-        f"🛡️ *ADMIN PANEL*\n\n"
+        f"{LOGO}\n{DIVIDER}\n\n🛡️ *ADMIN PANEL*\n\n"
         f"👥 Total Users:    `{total}`\n"
         f"⭐ Premium Users:  `{premiums}`\n"
-        f"🆓 Free Users:     `{free}`\n"
+        f"🆓 Free Users:     `{total-premiums}`\n"
         f"📊 Total Analyses: `{analyses}`\n"
-        f"👥 Total Referrals:`{referrals}`\n\n"
-        f"{DIVIDER}\n"
-        f"*Admin Commands:*\n"
-        f"`/grant <user_id> monthly` — Grant premium\n"
-        f"`/grant <user_id> lifetime` — Grant lifetime\n"
-        f"`/revoke <user_id>` — Revoke premium\n"
-        f"`/broadcast <message>` — Message all users\n"
-        f"`/userinfo <user_id>` — View user info",
+        f"👥 Total Referrals:`{referrals}`\n\n{DIVIDER}\n"
+        f"`/grant <uid> monthly|lifetime`\n"
+        f"`/revoke <uid>`\n"
+        f"`/broadcast <message>`\n"
+        f"`/userinfo <uid>`\n"
+        f"`/postsignals`\n"
+        f"`/generatepost`",
         parse_mode="Markdown"
     )
 
 async def grant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if int(update.effective_user.id) != ADMIN_ID:
-        return
+    if update.effective_user.id != ADMIN_ID: return
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text("Usage: `/grant <user_id> monthly|lifetime`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: `/grant <uid> monthly|lifetime`", parse_mode="Markdown")
         return
     target_uid, plan = args[0], args[1]
-    user = get_user(target_uid)
-    from datetime import timedelta
     if plan == "monthly":
-        expiry = datetime.now(timezone.utc) + timedelta(days=30)
-        user["premium"] = True; user["premium_type"] = "monthly"
-        user["premium_expiry"] = expiry.isoformat()
+        expiry = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+        await update_user(target_uid, premium=1, premium_type="monthly", premium_expiry=expiry)
     elif plan == "lifetime":
-        user["premium"] = True; user["premium_type"] = "lifetime"
-        user["premium_expiry"] = None
-    update_user(target_uid, user)
-    await update.message.reply_text(f"✅ Granted *{plan}* premium to `{target_uid}`", parse_mode="Markdown")
+        await update_user(target_uid, premium=1, premium_type="lifetime", premium_expiry="")
+    else:
+        await update.message.reply_text("Plan must be `monthly` or `lifetime`", parse_mode="Markdown"); return
+    await update.message.reply_text(f"✅ Granted *{plan}* to `{target_uid}`", parse_mode="Markdown")
     try:
         await context.bot.send_message(
             chat_id=int(target_uid),
-            text=f"{LOGO}\n\n🎁 *You've been granted {plan.capitalize()} Premium!*\n\nAll features are now unlocked! 🚀",
+            text=f"{LOGO}\n\n🎁 *You've been granted {plan.capitalize()} Premium!*\n\nAll features unlocked! 🚀",
             parse_mode="Markdown"
         )
-    except:
-        pass
+    except Exception as e:
+        logger.error(f"Grant notify error: {e}")
 
 async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if int(update.effective_user.id) != ADMIN_ID:
-        return
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: `/revoke <user_id>`", parse_mode="Markdown")
-        return
-    target_uid = args[0]
-    user = get_user(target_uid)
-    user["premium"] = False; user["premium_type"] = None; user["premium_expiry"] = None
-    update_user(target_uid, user)
-    await update.message.reply_text(f"✅ Revoked premium from `{target_uid}`", parse_mode="Markdown")
+    if update.effective_user.id != ADMIN_ID: return
+    if not context.args:
+        await update.message.reply_text("Usage: `/revoke <uid>`", parse_mode="Markdown"); return
+    await update_user(context.args[0], premium=0, premium_type="", premium_expiry="")
+    await update.message.reply_text(f"✅ Revoked premium from `{context.args[0]}`", parse_mode="Markdown")
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if int(update.effective_user.id) != ADMIN_ID:
-        return
+    if update.effective_user.id != ADMIN_ID: return
     if not context.args:
-        await update.message.reply_text("Usage: `/broadcast Your message here`", parse_mode="Markdown")
-        return
-    msg      = " ".join(context.args)
-    all_data = load_data()
+        await update.message.reply_text("Usage: `/broadcast Your message`", parse_mode="Markdown"); return
+    msg = " ".join(context.args)
     sent = 0; failed = 0
-    for target_uid in all_data:
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("SELECT uid FROM users") as cur:
+            uids = [r[0] for r in await cur.fetchall()]
+    for target_uid in uids:
         try:
             await context.bot.send_message(
                 chat_id=int(target_uid),
@@ -1758,45 +1689,93 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             sent += 1
-        except:
+        except Exception:
             failed += 1
-    await update.message.reply_text(
-        f"✅ Broadcast complete!\nSent: `{sent}` | Failed: `{failed}`",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text(f"✅ Broadcast done! Sent: `{sent}` | Failed: `{failed}`", parse_mode="Markdown")
 
 async def userinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if int(update.effective_user.id) != ADMIN_ID:
-        return
+    if update.effective_user.id != ADMIN_ID: return
     if not context.args:
-        await update.message.reply_text("Usage: `/userinfo <user_id>`", parse_mode="Markdown")
-        return
+        await update.message.reply_text("Usage: `/userinfo <uid>`", parse_mode="Markdown"); return
     target_uid = context.args[0]
-    user = get_user(target_uid)
+    user       = await get_user(target_uid)
+    alerts     = await get_alerts(target_uid)
+    watchlist  = await get_watchlist(target_uid)
+    referrals  = await get_referrals(target_uid)
     await update.message.reply_text(
-        f"👤 *User Info: {target_uid}*\n\n"
+        f"👤 *User: {target_uid}*\n\n"
         f"Username: @{user.get('username','N/A')}\n"
-        f"Premium: `{user.get('premium', False)}`\n"
-        f"Plan: `{user.get('premium_type','free')}`\n"
-        f"Expiry: `{user.get('premium_expiry','N/A')}`\n"
-        f"Analyses: `{user.get('total_analyses',0)}`\n"
-        f"Referrals: `{len(user.get('referrals',[]))}`\n"
-        f"Watchlist: `{user.get('watchlist',[])}`\n"
-        f"Joined: `{user.get('join_date','N/A')}`",
+        f"Premium: `{bool(user['premium'])}`\n"
+        f"Plan: `{user['premium_type'] or 'free'}`\n"
+        f"Expiry: `{user['premium_expiry'] or 'N/A'}`\n"
+        f"Analyses: `{user['total_analyses']}`\n"
+        f"Alerts: `{len(alerts)}`\n"
+        f"Watchlist: `{watchlist}`\n"
+        f"Referrals: `{len(referrals)}`\n"
+        f"Joined: `{user['join_date']}`",
         parse_mode="Markdown"
     )
 
 # ── BACKGROUND JOBS ───────────────────────────────────────────────────────────
+async def build_signal_message(now: datetime) -> str:
+    lines = [
+        "⚡ ATOMIC CRYPTO",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📅 Daily Signals — {now.strftime('%d %b %Y')} UTC",
+        f"⏰ {now.strftime('%H:%M')} UTC",
+        "",
+    ]
+    for coin in SIGNAL_COINS:
+        df = await fetch_ohlcv(coin, "1d", 200)
+        if df is None or len(df) < 60:
+            continue
+        ind   = compute_all(df)
+        pred  = score(ind)
+        sig_e = "🟢" if pred["signal"]=="BUY" else "🔴" if pred["signal"]=="SELL" else "🟡"
+        dir_e = "📈" if pred["direction"]=="UP" else "📉"
+        bar   = "█"*(pred["confidence"]//10) + "░"*(10-pred["confidence"]//10)
+        grok  = await get_grok_analysis(coin, ind, pred)
+        grok_sentiment = "N/A"
+        if grok:
+            for gl in grok.splitlines():
+                if "SENTIMENT" in gl and ":" in gl:
+                    grok_sentiment = gl.split(":",1)[1].strip()
+                    grok_sentiment = grok_sentiment.replace("*","").replace("_","").replace("`","")
+                    break
+        sent_e = "🟢" if "Bullish" in grok_sentiment else "🔴" if "Bearish" in grok_sentiment else "🟡"
+        lines += [
+            f"{sig_e} {coin}/USDT",
+            f"   Price: ${ind['price']:,.4f}",
+            f"   {dir_e} {pred['direction']} — {pred['signal']}",
+            f"   Confidence: {pred['confidence']}% {bar}",
+            f"   Risk: {pred['risk']}",
+            f"   {sent_e} X Sentiment: {grok_sentiment}",
+            "",
+        ]
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "Powered by 15+ indicators + Grok AI",
+        "Full analysis: @AtomicCrypto_bot",
+        f"Trade on BingX: {BINGX_LINK}",
+        f"Join Channel: {CHANNEL_LINK}",
+    ]
+    return "\n".join(lines)
+
 async def check_alerts_job(context):
-    """Check price alerts every 60 seconds"""
-    all_data = load_data()
-    for uid, user in all_data.items():
-        alerts    = user.get("alerts", [])
-        remaining = []
-        for a in alerts:
-            price = fetch_price(a["symbol"])
-            if price is None:
-                remaining.append(a); continue
+    """Optimized: group alerts by symbol, fetch price once per symbol"""
+    alerts = await get_alerts()
+    if not alerts:
+        return
+    # Group by symbol
+    by_symbol: dict = {}
+    for a in alerts:
+        by_symbol.setdefault(a["symbol"], []).append(a)
+    # Check each symbol once
+    for symbol, symbol_alerts in by_symbol.items():
+        price = await fetch_price(symbol)
+        if price is None:
+            continue
+        for a in symbol_alerts:
             hit = (a["direction"]=="above" and price >= a["target"]) or \
                   (a["direction"]=="below" and price <= a["target"])
             if hit:
@@ -1814,223 +1793,127 @@ async def check_alerts_job(context):
                         ),
                         parse_mode=None
                     )
-                except:
-                    pass
-            else:
-                remaining.append(a)
-        if len(remaining) != len(alerts):
-            user["alerts"] = remaining
-            update_user(uid, user)
-
-async def build_signal_message(now: datetime) -> str:
-    """Build the daily signal message for channel + users — plain text only"""
-    lines = [
-        "⚡ ATOMIC CRYPTO",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📅 Daily Signals — {now.strftime('%d %b %Y')} UTC",
-        f"⏰ {now.strftime('%H:%M')} UTC",
-        "",
-    ]
-    for coin in SIGNAL_COINS:
-        df = fetch_ohlcv(coin, "1d", 200)
-        if df is None or len(df) < 60:
-            continue
-        ind  = compute_all(df)
-        pred = score(ind)
-        sig_e = "🟢" if pred["signal"]=="BUY" else "🔴" if pred["signal"]=="SELL" else "🟡"
-        dir_e = "📈" if pred["direction"]=="UP" else "📉"
-        bar   = "█"*(pred["confidence"]//10) + "░"*(10-pred["confidence"]//10)
-        grok  = await get_grok_analysis(coin, ind, pred)
-        grok_sentiment = "N/A"
-        if grok:
-            for gl in grok.splitlines():
-                if "SENTIMENT" in gl and ":" in gl:
-                    grok_sentiment = gl.split(":",1)[1].strip()
-                    grok_sentiment = grok_sentiment.replace("*","").replace("_","").replace("`","")
-                    break
-        sent_e = "🟢" if "Bullish" in grok_sentiment else "🔴" if "Bearish" in grok_sentiment else "🟡"
-        lines.append(f"{sig_e} {coin}/USDT")
-        lines.append(f"   Price: ${ind['price']:,.4f}")
-        lines.append(f"   {dir_e} {pred['direction']} — Signal: {pred['signal']}")
-        lines.append(f"   Confidence: {pred['confidence']}% {bar}")
-        lines.append(f"   Risk: {pred['risk']}")
-        lines.append(f"   {sent_e} X Sentiment: {grok_sentiment}")
-        lines.append("")
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("Powered by 15 indicators + Grok AI")
-    lines.append("Full analysis: @AtomicCrypto_bot")
-    lines.append(f"Trade on BingX: {BINGX_LINK}")
-    lines.append(f"Join Channel: {CHANNEL_LINK}")
-    return "\n".join(lines)
+                    await delete_alert(a["id"])
+                except Exception as ex:
+                    logger.error(f"Alert send error: {ex}")
 
 async def daily_signals_job(context):
-    """Post daily signals to channel at 09:00 UTC & send to premium users at their set time"""
+    """Post to channel at 09:00 UTC + send to premium users at their set time"""
     now      = datetime.now(timezone.utc)
     now_time = f"{now.hour:02d}:{now.minute:02d}"
 
-    # ── Post to public channel at 09:00 UTC every day ──
     if now_time == "09:00":
         try:
             msg = await build_signal_message(now)
             await context.bot.send_message(
-                chat_id=CHANNEL_USERNAME,
-                text=msg,
-                parse_mode=None,
-                disable_web_page_preview=True
+                chat_id=CHANNEL_USERNAME, text=msg,
+                parse_mode=None, disable_web_page_preview=True
             )
             logger.info("✅ Daily signals posted to channel")
         except Exception as e:
             logger.error(f"Channel post error: {e}")
 
-    # ── Send to premium users at their preferred time ──
-    all_data = load_data()
-    for uid, user in all_data.items():
-        if not user.get("signal_enabled", True):
-            continue
-        if not is_premium(uid):
-            continue
-        user_time = user.get("signal_time", "09:00")
-        if user_time != now_time:
-            continue
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT uid FROM users WHERE signal_enabled=1 AND premium=1 AND signal_time=?",
+            (now_time,)
+        ) as cur:
+            rows = await cur.fetchall()
+
+    for row in rows:
         try:
             msg = await build_signal_message(now)
             await context.bot.send_message(
-                chat_id=int(uid),
-                text=msg,
-                parse_mode=None,
-                disable_web_page_preview=True
+                chat_id=int(row["uid"]), text=msg,
+                parse_mode=None, disable_web_page_preview=True
             )
         except Exception as e:
-            logger.error(f"Daily signal error for {uid}: {e}")
+            logger.error(f"Daily signal error {row['uid']}: {e}")
+
+async def postsignals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    await update.message.reply_text("⏳ Posting signals to channel...")
+    try:
+        now = datetime.now(timezone.utc)
+        msg = await build_signal_message(now)
+        await context.bot.send_message(
+            chat_id=CHANNEL_USERNAME, text=msg,
+            parse_mode=None, disable_web_page_preview=True
+        )
+        await update.message.reply_text("✅ Signals posted to channel!")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
 
 async def generatepost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate a ready-to-post X/Twitter post using Grok"""
+    if update.effective_user.id != ADMIN_ID: return
     await update.message.reply_text("⏳ Generating X post with Grok AI...")
     try:
-        # Get BTC signal as base
-        df = fetch_ohlcv("BTC", "1d", 200)
+        df = await fetch_ohlcv("BTC", "1d", 200)
         if df is None or len(df) < 60:
-            await update.message.reply_text("❌ Could not fetch market data.")
-            return
+            await update.message.reply_text("❌ Could not fetch market data."); return
         ind  = compute_all(df)
         pred = score(ind)
-        sig_e = "🟢" if pred["signal"]=="BUY" else "🔴" if pred["signal"]=="SELL" else "🟡"
-
         prompt = (
             f"Write a professional crypto signal post for X (Twitter). "
             f"Today's BTC signal: {pred['signal']} with {pred['confidence']}% confidence. "
             f"Direction: {pred['direction']}. RSI: {ind['rsi']}. "
             f"MACD: {ind['macd_cross']}. Price: ${ind['price']:,.2f}. "
             f"Check X/Twitter for current BTC sentiment too.\n\n"
-            f"Requirements:\n"
-            f"- Max 280 characters\n"
-            f"- Include signal, price, confidence\n"
-            f"- Add 3-4 relevant hashtags\n"
-            f"- Energetic and professional tone\n"
-            f"- End with @AtomicCrypto_bot\n"
-            f"- No markdown, plain text only\n"
+            f"Requirements:\n- Max 280 characters\n- Include signal, price, confidence\n"
+            f"- Add 3-4 relevant hashtags\n- Energetic and professional tone\n"
+            f"- End with @AtomicCrypto_bot\n- No markdown, plain text only\n"
             f"Return ONLY the post text, nothing else."
         )
-
-        r = requests.post(
-            "https://api.x.ai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROK_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "grok-3-fast",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 100,
-                "temperature": 0.8
-            },
-            timeout=15
-        )
-        result = r.json()
-        logger.info(f"Grok response: {result}")
-        if "choices" not in result:
-            await update.message.reply_text(f"❌ Grok error: {result.get('error', result)}")
-            return
-        post_text = result["choices"][0]["message"]["content"].strip()
-
+        post_text = await call_grok(prompt)
+        if not post_text:
+            await update.message.reply_text("❌ Grok unavailable. Try again later."); return
         await update.message.reply_text(
-            f"✅ *Ready to post on X:*\n\n"
-            f"`{post_text}`\n\n"
-            f"👆 Tap to copy, then paste on X!",
+            f"✅ *Ready to post on X:*\n\n`{post_text}`\n\n👆 Tap to copy, paste on X!",
             parse_mode="Markdown"
         )
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
 
-
-    """Admin: manually trigger a channel signal post"""
-    if int(update.effective_user.id) != ADMIN_ID:
-        return
-    await update.message.reply_text("⏳ Posting signals to channel...")
-    try:
-        now = datetime.now(timezone.utc)
-        msg = await build_signal_message(now)
-        await context.bot.send_message(
-            chat_id=CHANNEL_USERNAME,
-            text=msg,
-            parse_mode=None,
-            disable_web_page_preview=True
-        )
-        await update.message.reply_text("✅ Signals posted to channel!")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
-
-async def postsignals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: manually trigger a channel signal post"""
-    if int(update.effective_user.id) != ADMIN_ID:
-        return
-    await update.message.reply_text("⏳ Posting signals to channel...")
-    try:
-        now = datetime.now(timezone.utc)
-        msg = await build_signal_message(now)
-        await context.bot.send_message(
-            chat_id=CHANNEL_USERNAME,
-            text=msg,
-            parse_mode=None,
-            disable_web_page_preview=True
-        )
-        await update.message.reply_text("✅ Signals posted to channel!")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
-
 # ── MAIN ──────────────────────────────────────────────────────────────────────
+async def post_init(application):
+    await init_db()
+    logger.info("✅ Database initialized")
+
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
-    # Commands
-    app.add_handler(CommandHandler("start",     start))
-    app.add_handler(CommandHandler("alert",     alert_cmd))
-    app.add_handler(CommandHandler("add",       add_portfolio_cmd))
-    app.add_handler(CommandHandler("settime",   settime_cmd))
-    app.add_handler(CommandHandler("signals",   signals_cmd))
-    app.add_handler(CommandHandler("admin",     admin_cmd))
-    app.add_handler(CommandHandler("grant",     grant_cmd))
-    app.add_handler(CommandHandler("revoke",    revoke_cmd))
-    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-    app.add_handler(CommandHandler("userinfo",  userinfo_cmd))
-    app.add_handler(CommandHandler("postsignals",   postsignals_cmd))
-    app.add_handler(CommandHandler("generatepost",  generatepost_cmd))
-
-    # Callbacks & messages
+    app.add_handler(CommandHandler("start",        start))
+    app.add_handler(CommandHandler("add",          add_portfolio_cmd))
+    app.add_handler(CommandHandler("settime",      settime_cmd))
+    app.add_handler(CommandHandler("signals",      signals_cmd))
+    app.add_handler(CommandHandler("admin",        admin_cmd))
+    app.add_handler(CommandHandler("grant",        grant_cmd))
+    app.add_handler(CommandHandler("revoke",       revoke_cmd))
+    app.add_handler(CommandHandler("broadcast",    broadcast_cmd))
+    app.add_handler(CommandHandler("userinfo",     userinfo_cmd))
+    app.add_handler(CommandHandler("postsignals",  postsignals_cmd))
+    app.add_handler(CommandHandler("generatepost", generatepost_cmd))
     app.add_handler(CallbackQueryHandler(menu_handler))
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, payment_success))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    # Background jobs
-    app.job_queue.run_repeating(check_alerts_job,  interval=60,   first=10)
-    app.job_queue.run_repeating(daily_signals_job, interval=60,   first=30)
+    app.job_queue.run_repeating(check_alerts_job,  interval=60, first=10)
+    app.job_queue.run_repeating(daily_signals_job, interval=60, first=30)
 
-    print("⚡ Atomic Crypto Bot v2.0 — Professional Edition")
+    print("⚡ Atomic Crypto Bot v3.0 — Professional Edition")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("✅ All features loaded")
-    print("✅ Background jobs running")
-    print("✅ Admin panel ready")
+    print("✅ SQLite database")
+    print("✅ Async HTTP (aiohttp)")
+    print("✅ Smart caching")
+    print("✅ Optimized alerts")
+    print("✅ .env security")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
