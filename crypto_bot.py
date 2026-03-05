@@ -1,27 +1,3 @@
-"""
-⚡ ATOMIC CRYPTO BOT — PROFESSIONAL EDITION v2.0
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Author: Atomic Crypto
-Features:
-  ✅ Free / Premium tiers (Telegram Stars)
-  ✅ 15+ Technical indicators
-  ✅ Auto daily signals (user sets time)
-  ✅ Top gainers & losers
-  ✅ Coin fundamentals
-  ✅ Portfolio tracker
-  ✅ Referral system
-  ✅ Leaderboard
-  ✅ Admin panel
-  ✅ Price alerts (auto check)
-  ✅ Watchlist
-  ✅ Fear & Greed index
-  ✅ Live crypto news
-  ✅ Market overview
-  ✅ Affiliate links (BingX + Binance)
-  ✅ Dark & gold UI
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-
 import requests
 import pandas as pd
 import numpy as np
@@ -47,7 +23,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = "8726083513:AAGxtqLZeBLGOy6RRdoKYzHmJjo8Vr1C5pU"
 ADMIN_ID       = 8466348943
 DATA_FILE      = "atomic_data.json"
-GROK_API_KEY   = "YOUR_GROK_API_KEY"  # Replace with your key from console.x.ai
+GROK_API_KEY = os.environ.get("GROK_API_KEY", "")
 
 # Pricing (Telegram Stars)
 PREMIUM_MONTHLY_STARS   = 500    # ~$4.99
