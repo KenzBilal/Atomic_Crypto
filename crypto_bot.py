@@ -1033,16 +1033,140 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── PRICE ALERTS ──
     elif data == "menu_alerts":
+        alerts  = user.get("alerts", [])
+        premium = is_premium(uid)
+        max_alerts = 10 if premium else 2
+        buttons = []
+        for i, a in enumerate(alerts):
+            e = "📈" if a["direction"] == "above" else "📉"
+            buttons.append([
+                InlineKeyboardButton(
+                    f"{e} {a['symbol']} {a['direction']} ${a['target']:,.2f}",
+                    callback_data=f"alert_info|{i}"
+                ),
+                InlineKeyboardButton("🗑", callback_data=f"alert_del|{i}")
+            ])
+        if len(alerts) < max_alerts:
+            buttons.append([InlineKeyboardButton("➕ New Alert", callback_data="alert_new")])
+        buttons.append([InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")])
+        limit_text = f"{len(alerts)}/{max_alerts} alerts used"
+        tier_text  = "Premium: 10 alerts" if premium else "Free: 2 alerts max — Upgrade for 10"
+        await query.edit_message_text(
+            f"{LOGO}\n{DIVIDER}\n\n"
+            f"🚨 Price Alerts\n\n"
+            f"{limit_text}\n"
+            f"{tier_text}\n\n"
+            f"{'Tap an alert to view or 🗑 to delete' if alerts else 'No alerts yet — tap + New Alert to add one!'}",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="Markdown"
+        )
+
+    elif data == "alert_new":
+        rows = [[InlineKeyboardButton(c, callback_data=f"alert_coin|{c}") for c in TOP_COINS]]
+        rows.append([InlineKeyboardButton("🔍 Other Coin", callback_data="alert_search")])
+        rows.append([InlineKeyboardButton("🔙 Back", callback_data="menu_alerts")])
+        await query.edit_message_text(
+            f"{LOGO}\n{DIVIDER}\n\n"
+            "🚨 *New Alert*\n\nStep 1: Select a coin:",
+            reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode="Markdown"
+        )
+
+    elif data == "alert_search":
+        context.user_data["action"] = "alert_search"
+        await query.edit_message_text(
+            f"{LOGO}\n{DIVIDER}\n\n"
+            "🔍 Type the coin symbol:\n_(e.g. PEPE, AVAX, LINK)_",
+            parse_mode="Markdown"
+        )
+
+    elif data.startswith("alert_coin|"):
+        symbol = data.split("|")[1]
+        context.user_data["alert_symbol"] = symbol
+        await query.edit_message_text(
+            f"{LOGO}\n{DIVIDER}\n\n"
+            f"🚨 *New Alert — {symbol}*\n\n"
+            "Step 2: Select direction:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📈 Price Goes Above", callback_data=f"alert_dir|{symbol}|above")],
+                [InlineKeyboardButton("📉 Price Goes Below", callback_data=f"alert_dir|{symbol}|below")],
+                [InlineKeyboardButton("🔙 Back", callback_data="alert_new")],
+            ]),
+            parse_mode="Markdown"
+        )
+
+    elif data.startswith("alert_dir|"):
+        _, symbol, direction = data.split("|")
+        context.user_data["alert_symbol"]    = symbol
+        context.user_data["alert_direction"] = direction
+        context.user_data["action"]          = "alert_price"
+        price = fetch_price(symbol)
+        price_hint = f"Current price: ${price:,.4f}" if price else ""
+        e = "📈" if direction == "above" else "📉"
+        await query.edit_message_text(
+            f"{LOGO}\n{DIVIDER}\n\n"
+            f"🚨 *New Alert — {symbol}*\n\n"
+            f"{e} Alert when price goes *{direction}*\n"
+            f"{price_hint}\n\n"
+            "Step 3: Type the target price:\n_(just the number, e.g. 70000)_",
+            parse_mode="Markdown"
+        )
+
+    elif data.startswith("alert_del|"):
+        idx    = int(data.split("|")[1])
         alerts = user.get("alerts", [])
-        msg    = f"{LOGO}\n{DIVIDER}\n\n🚨 *Price Alerts*\n\n"
-        if alerts:
-            for a in alerts:
-                e = "📈" if a["direction"] == "above" else "📉"
-                msg += f"{e} *{a['symbol']}* {a['direction']} `${a['target']:,.2f}`\n"
-        else:
-            msg += "No alerts set.\n"
-        msg += f"\n{DIVIDER}\n📌 _Set alert:_ `/alert BTC above 70000`\n_or_ `/alert ETH below 3000`"
-        await query.edit_message_text(msg, reply_markup=back_kb(), parse_mode="Markdown")
+        if 0 <= idx < len(alerts):
+            removed = alerts.pop(idx)
+            user["alerts"] = alerts
+            update_user(uid, user)
+            await query.answer(f"🗑 Alert deleted!")
+        # Refresh alerts menu
+        alerts  = user.get("alerts", [])
+        premium = is_premium(uid)
+        max_alerts = 10 if premium else 2
+        buttons = []
+        for i, a in enumerate(alerts):
+            e = "📈" if a["direction"] == "above" else "📉"
+            buttons.append([
+                InlineKeyboardButton(
+                    f"{e} {a['symbol']} {a['direction']} ${a['target']:,.2f}",
+                    callback_data=f"alert_info|{i}"
+                ),
+                InlineKeyboardButton("🗑", callback_data=f"alert_del|{i}")
+            ])
+        if len(alerts) < max_alerts:
+            buttons.append([InlineKeyboardButton("➕ New Alert", callback_data="alert_new")])
+        buttons.append([InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")])
+        await query.edit_message_text(
+            f"{LOGO}\n{DIVIDER}\n\n"
+            f"🚨 Price Alerts\n\n"
+            f"{len(alerts)}/{max_alerts} alerts used\n\n"
+            f"{'Tap 🗑 to delete' if alerts else 'No alerts — tap + New Alert!'}",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="Markdown"
+        )
+
+    elif data.startswith("alert_info|"):
+        idx    = int(data.split("|")[1])
+        alerts = user.get("alerts", [])
+        if 0 <= idx < len(alerts):
+            a  = alerts[idx]
+            e  = "📈" if a["direction"] == "above" else "📉"
+            p  = fetch_price(a["symbol"])
+            current = f"${p:,.4f}" if p else "N/A"
+            await query.edit_message_text(
+                f"{LOGO}\n{DIVIDER}\n\n"
+                f"🚨 *Alert Details*\n\n"
+                f"🪙 Coin: *{a['symbol']}*\n"
+                f"{e} Trigger: *{a['direction']}* `${a['target']:,.2f}`\n"
+                f"💰 Current Price: `{current}`\n\n"
+                f"{'📈 Price is above target!' if p and p >= a['target'] and a['direction']=='above' else '📉 Price is below target!' if p and p <= a['target'] and a['direction']=='below' else '⏳ Waiting for target...'}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🗑 Delete Alert", callback_data=f"alert_del|{idx}")],
+                    [InlineKeyboardButton("🔙 Back", callback_data="menu_alerts")],
+                ]),
+                parse_mode="Markdown"
+            )
 
     # ── PORTFOLIO ──
     elif data == "menu_portfolio":
@@ -1474,6 +1598,62 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=timeframe_kb(symbol, uid),
             parse_mode="Markdown"
         )
+    elif action == "alert_search":
+        symbol = text.replace("USDT","").replace("/","")
+        context.user_data["action"]       = None
+        context.user_data["alert_symbol"] = symbol
+        await update.message.reply_text(
+            f"{LOGO}\n{DIVIDER}\n\n"
+            f"🚨 *New Alert — {symbol}*\n\n"
+            "Select direction:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📈 Price Goes Above", callback_data=f"alert_dir|{symbol}|above")],
+                [InlineKeyboardButton("📉 Price Goes Below", callback_data=f"alert_dir|{symbol}|below")],
+                [InlineKeyboardButton("🔙 Back", callback_data="alert_new")],
+            ]),
+            parse_mode="Markdown"
+        )
+    elif action == "alert_price":
+        symbol    = context.user_data.get("alert_symbol", "")
+        direction = context.user_data.get("alert_direction", "")
+        context.user_data["action"] = None
+        try:
+            target = float(text.replace(",","").replace("$",""))
+        except:
+            await update.message.reply_text(
+                "⚠️ Invalid price. Please type just the number e.g. `70000`",
+                parse_mode="Markdown"
+            )
+            return
+        user    = get_user(uid)
+        premium = is_premium(uid)
+        max_alerts = 10 if premium else 2
+        if len(user.get("alerts",[])) >= max_alerts:
+            await update.message.reply_text(
+                f"⚠️ Alert limit reached ({max_alerts}).\n"
+                f"{'Delete an alert first.' if premium else 'Upgrade to Premium for 10 alerts!'}",
+                parse_mode="Markdown"
+            )
+            return
+        user["alerts"].append({
+            "symbol":    clean_symbol(symbol),
+            "direction": direction,
+            "target":    target,
+            "chat_id":   update.effective_chat.id
+        })
+        update_user(uid, user)
+        e = "📈" if direction == "above" else "📉"
+        await update.message.reply_text(
+            f"{LOGO}\n{DIVIDER}\n\n"
+            f"✅ *Alert Set!*\n\n"
+            f"{e} *{clean_symbol(symbol)}* {direction} `${target:,.2f}`\n\n"
+            f"I'll notify you the moment it triggers! 🔔",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Add Another", callback_data="alert_new")],
+                [InlineKeyboardButton("🏠 Main Menu",   callback_data="menu_main")],
+            ]),
+            parse_mode="Markdown"
+        )
     elif action == "coininfo":
         symbol = text.replace("USDT","").replace("/","")
         context.user_data["action"] = None
@@ -1648,12 +1828,15 @@ async def check_alerts_job(context):
                 try:
                     await context.bot.send_message(
                         chat_id=a["chat_id"],
-                        text=f"{LOGO}\n{DIVIDER}\n\n"
-                             f"🚨 *ALERT TRIGGERED!*\n\n"
-                             f"{e} *{a['symbol']}* hit `${price:,.4f}`\n"
-                             f"Target: {a['direction']} `${a['target']:,.2f}`\n\n"
-                             f"_Check the market now!_ 📊",
-                        parse_mode="Markdown"
+                        text=(
+                            f"⚡ ATOMIC CRYPTO\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                            f"🚨 ALERT TRIGGERED!\n\n"
+                            f"{e} {a['symbol']} hit ${price:,.4f}\n"
+                            f"Target: {a['direction']} ${a['target']:,.2f}\n\n"
+                            f"Check the market now! 📊"
+                        ),
+                        parse_mode=None
                     )
                 except:
                     pass
