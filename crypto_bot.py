@@ -1,3 +1,27 @@
+"""
+⚡ ATOMIC CRYPTO BOT — PROFESSIONAL EDITION v2.0
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Author: Atomic Crypto
+Features:
+  ✅ Free / Premium tiers (Telegram Stars)
+  ✅ 15+ Technical indicators
+  ✅ Auto daily signals (user sets time)
+  ✅ Top gainers & losers
+  ✅ Coin fundamentals
+  ✅ Portfolio tracker
+  ✅ Referral system
+  ✅ Leaderboard
+  ✅ Admin panel
+  ✅ Price alerts (auto check)
+  ✅ Watchlist
+  ✅ Fear & Greed index
+  ✅ Live crypto news
+  ✅ Market overview
+  ✅ Affiliate links (BingX + Binance)
+  ✅ Dark & gold UI
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
 import requests
 import pandas as pd
 import numpy as np
@@ -23,7 +47,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = "8726083513:AAGxtqLZeBLGOy6RRdoKYzHmJjo8Vr1C5pU"
 ADMIN_ID       = 8466348943
 DATA_FILE      = "atomic_data.json"
-GROK_API_KEY = os.environ.get("GROK_API_KEY", "")
+GROK_API_KEY   = "YOUR_GROK_API_KEY"  # Replace with your key from console.x.ai
 
 # Pricing (Telegram Stars)
 PREMIUM_MONTHLY_STARS   = 500    # ~$4.99
@@ -570,22 +594,21 @@ def format_grok_section(grok_text: str) -> str:
             k, v = line.split(":", 1)
             lines[k.strip()] = v.strip()
 
-    sentiment  = lines.get("SENTIMENT", "")
-    analysis   = lines.get("ANALYSIS", "")
-    key_level  = lines.get("KEY_LEVEL", "")
-    outlook    = lines.get("OUTLOOK", "")
+    sentiment  = lines.get("SENTIMENT", "").replace("*","").replace("_","").replace("`","")
+    analysis   = lines.get("ANALYSIS", "").replace("*","").replace("_","").replace("`","")
+    key_level  = lines.get("KEY_LEVEL", "").replace("*","").replace("_","").replace("`","")
+    outlook    = lines.get("OUTLOOK", "").replace("*","").replace("_","").replace("`","")
 
     sent_e = "🟢" if "Bullish" in sentiment else "🔴" if "Bearish" in sentiment else "🟡"
 
     return (
-        f"\n┌─── 🤖 GROK AI + X SENTIMENT ──\n"
-        f"│ {sent_e} {sentiment}\n"
-        f"│\n"
-        f"│ {analysis}\n"
-        f"│\n"
-        f"│ 🎯 Key Level: {key_level}\n"
-        f"│ 🔭 Outlook: {outlook}\n"
-        f"└────────────────────────────────"
+        f"\n{DIVIDER}\n"
+        f"🤖 GROK AI + X SENTIMENT\n"
+        f"{sent_e} {sentiment}\n\n"
+        f"{analysis}\n\n"
+        f"🎯 Key Level: {key_level}\n"
+        f"🔭 Outlook: {outlook}\n"
+        f"{DIVIDER}"
     )
 
 def format_analysis(symbol, tf_label, ind, pred, premium=False, grok_text=None) -> str:
@@ -603,11 +626,12 @@ def format_analysis(symbol, tf_label, ind, pred, premium=False, grok_text=None) 
         grok_section = format_grok_section(grok_text)
     elif not premium:
         grok_section = (
-            "\n┌─── 🤖 GROK AI + X SENTIMENT ──\n"
-            "│ 🔒 Premium Feature\n"
-            "│ Upgrade to unlock AI analysis\n"
-            "│ + live X/Twitter sentiment!\n"
-            "└────────────────────────────────"
+            f"\n{DIVIDER}\n"
+            "🤖 GROK AI + X SENTIMENT\n"
+            "🔒 Premium Feature\n"
+            "Upgrade to unlock AI analysis\n"
+            "and live X/Twitter sentiment!\n"
+            f"{DIVIDER}"
         )
 
     return f"""
@@ -1691,7 +1715,7 @@ async def daily_signals_job(context):
             await context.bot.send_message(
                 chat_id=CHANNEL_USERNAME,
                 text=msg,
-                parse_mode="Markdown",
+                parse_mode=None,
                 disable_web_page_preview=True
             )
             logger.info("✅ Daily signals posted to channel")
