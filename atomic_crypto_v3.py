@@ -2,7 +2,7 @@
 ⚡ ATOMIC CRYPTO BOT — PROFESSIONAL EDITION v3.1
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 v3.1 Fixes (Gemini Review):
-  ✅ Global aiohttp session — connection pooling
+  ✅ Requests session — proxy compatible
   ✅ Daily signals built once, sent to all users
   ✅ Atomic SQL increments — no race conditions
   ✅ Graceful shutdown — no memory leaks
@@ -14,7 +14,7 @@ import os
 import asyncio
 import logging
 import aiosqlite
-import aiohttp
+import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
@@ -32,27 +32,11 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Requests session — auto uses PythonAnywhere proxy
+_session = requests.Session()
+_session.verify = False
+
 # ── GLOBAL HTTP SESSION ───────────────────────────────────────────────────────
-_http_session: aiohttp.ClientSession | None = None
-
-async def get_session() -> aiohttp.ClientSession:
-    global _http_session
-    if _http_session is None or _http_session.closed:
-        connector = aiohttp.TCPConnector(ssl=False)
-        _http_session = aiohttp.ClientSession(connector=connector)
-    return _http_session
-
-# PythonAnywhere proxy
-PROXY = "http://proxy.server:3128"
-
-async def _get(url, **kwargs):
-    session = await get_session()
-    return session.get(url, proxy=PROXY, ssl=False, **kwargs)
-
-async def _post(url, **kwargs):
-    session = await get_session()
-    return session.post(url, proxy=PROXY, ssl=False, **kwargs)
-
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN        = os.environ["TELEGRAM_TOKEN"]
 ADMIN_ID              = int(os.environ.get("ADMIN_ID", "8466348943"))
@@ -284,7 +268,8 @@ def clean_symbol(symbol: str) -> str:
     return symbol.upper().strip().replace("USDT","").replace("BUSD","").replace("/","").replace("-","")
 
 # ── ASYNC API CALLS ───────────────────────────────────────────────────────────
-async def fetch_ohlcv(symbol: str, interval: str, limit: int = 200):
+# ── API HELPERS (sync requests — auto uses PythonAnywhere proxy) ──────────────
+def fetch_ohlcv(symbol: str, interval: str, limit: int = 200):
     symbol = clean_symbol(symbol)
     cache_key = f"{symbol}_{interval}"
     if cache_key in _ohlcv_cache:
@@ -292,123 +277,91 @@ async def fetch_ohlcv(symbol: str, interval: str, limit: int = 200):
     interval_map = {"1h": "1hour", "4h": "4hour", "1d": "1day"}
     kc_interval  = interval_map.get(interval, "1hour")
     try:
-        async with _get(
-            "https://api.kucoin.com/api/v1/market/candles",
-            params={"symbol": f"{symbol}-USDT", "type": kc_interval},
-            timeout=aiohttp.ClientTimeout(total=10)
-        ) as r:
-            data = (await r.json()).get("data", [])
-        if not data:
-            return None
+        r    = _session.get("https://api.kucoin.com/api/v1/market/candles",
+                            params={"symbol": f"{symbol}-USDT", "type": kc_interval}, timeout=10)
+        data = r.json().get("data", [])
+        if not data: return None
         data = list(reversed(data))[-limit:]
-        df = pd.DataFrame(data, columns=["open_time","open","close","high","low","volume","turnover"])
+        df   = pd.DataFrame(data, columns=["open_time","open","close","high","low","volume","turnover"])
         for col in ["open","high","low","close","volume"]:
             df[col] = df[col].astype(float)
         _ohlcv_cache[cache_key] = df
         return df
-    except aiohttp.ClientError as e:
-        logger.error(f"fetch_ohlcv error: {e}")
-        return None
+    except Exception as e:
+        logger.error(f"fetch_ohlcv error: {e}"); return None
 
-async def fetch_price(symbol: str) -> float | None:
+def fetch_price(symbol: str) -> float | None:
     symbol = clean_symbol(symbol)
-    if symbol in _price_cache:
-        return _price_cache[symbol]
+    if symbol in _price_cache: return _price_cache[symbol]
     try:
-        async with _get(
-            "https://api.kucoin.com/api/v1/market/orderbook/level1",
-            params={"symbol": f"{symbol}-USDT"},
-            timeout=aiohttp.ClientTimeout(total=5)
-        ) as r:
-            price = float((await r.json())["data"]["price"])
+        r     = _session.get("https://api.kucoin.com/api/v1/market/orderbook/level1",
+                             params={"symbol": f"{symbol}-USDT"}, timeout=5)
+        price = float(r.json()["data"]["price"])
         _price_cache[symbol] = price
         return price
-    except (aiohttp.ClientError, KeyError, TypeError) as e:
-        logger.error(f"fetch_price error {symbol}: {e}")
-        return None
+    except Exception as e:
+        logger.error(f"fetch_price error {symbol}: {e}"); return None
 
-async def fetch_24h(symbol: str) -> dict | None:
+def fetch_24h(symbol: str) -> dict | None:
     symbol = clean_symbol(symbol)
-    if symbol in _24h_cache:
-        return _24h_cache[symbol]
+    if symbol in _24h_cache: return _24h_cache[symbol]
     try:
-        async with _get(
-            "https://api.kucoin.com/api/v1/market/stats",
-            params={"symbol": f"{symbol}-USDT"},
-            timeout=aiohttp.ClientTimeout(total=5)
-        ) as r:
-            d = (await r.json()).get("data", {})
-        if not d:
-            return None
+        r  = _session.get("https://api.kucoin.com/api/v1/market/stats",
+                          params={"symbol": f"{symbol}-USDT"}, timeout=5)
+        d  = r.json().get("data", {})
+        if not d: return None
         last   = float(d.get("last", 0))
         open_  = float(d.get("open", 1))
         change = ((last - open_) / open_ * 100) if open_ else 0
-        result = {
-            "price": last, "change": round(change, 2),
-            "high": float(d.get("high", 0)), "low": float(d.get("low", 0)),
-            "vol": float(d.get("volValue", 0)),
-        }
+        result = {"price": last, "change": round(change,2),
+                  "high": float(d.get("high",0)), "low": float(d.get("low",0)),
+                  "vol":  float(d.get("volValue",0))}
         _24h_cache[symbol] = result
         return result
-    except (aiohttp.ClientError, KeyError, TypeError) as e:
-        logger.error(f"fetch_24h error {symbol}: {e}")
-        return None
+    except Exception as e:
+        logger.error(f"fetch_24h error {symbol}: {e}"); return None
 
-async def fetch_fear_greed() -> dict:
-    if "fg" in _fg_cache:
-        return _fg_cache["fg"]
+def fetch_fear_greed() -> dict:
+    if "fg" in _fg_cache: return _fg_cache["fg"]
     try:
-        async with _get(
-            "https://api.alternative.me/fng/",
-            timeout=aiohttp.ClientTimeout(total=5)
-        ) as r:
-            d = (await r.json())["data"][0]
+        r      = _session.get("https://api.alternative.me/fng/", timeout=5)
+        d      = r.json()["data"][0]
         result = {"value": int(d["value"]), "label": d["value_classification"]}
         _fg_cache["fg"] = result
         return result
-    except (aiohttp.ClientError, KeyError) as e:
+    except Exception as e:
         logger.error(f"fetch_fear_greed error: {e}")
         return {"value": 50, "label": "Unknown"}
 
-async def fetch_news() -> list:
-    if "news" in _news_cache:
-        return _news_cache["news"]
+def fetch_news() -> list:
+    if "news" in _news_cache: return _news_cache["news"]
     try:
-        async with _get(
-            "https://min-api.cryptocompare.com/data/v2/news/?lang=EN&sortOrder=latest",
-            timeout=aiohttp.ClientTimeout(total=8)
-        ) as r:
-            items = (await r.json()).get("Data", [])[:5]
+        r      = _session.get("https://min-api.cryptocompare.com/data/v2/news/?lang=EN&sortOrder=latest", timeout=8)
+        items  = r.json().get("Data", [])[:5]
         result = [{"title": i["title"], "url": i["url"], "source": i["source_info"]["name"]} for i in items]
         _news_cache["news"] = result
         return result
-    except (aiohttp.ClientError, KeyError) as e:
-        logger.error(f"fetch_news error: {e}")
-        return []
+    except Exception as e:
+        logger.error(f"fetch_news error: {e}"); return []
 
-async def fetch_top_movers() -> dict:
-    if "movers" in _movers_cache:
-        return _movers_cache["movers"]
+def fetch_top_movers() -> dict:
+    if "movers" in _movers_cache: return _movers_cache["movers"]
     try:
-        async with _get(
-            "https://api.kucoin.com/api/v1/market/allTickers",
-            timeout=aiohttp.ClientTimeout(total=10)
-        ) as r:
-            tickers = (await r.json()).get("data", {}).get("ticker", [])
-        usdt = [t for t in tickers if t["symbol"].endswith("-USDT") and t.get("changeRate")]
-        usdt = [t for t in usdt if float(t.get("vol", 0)) > 100000]
+        r       = _session.get("https://api.kucoin.com/api/v1/market/allTickers", timeout=10)
+        tickers = r.json().get("data", {}).get("ticker", [])
+        usdt    = [t for t in tickers if t["symbol"].endswith("-USDT") and t.get("changeRate")]
+        usdt    = [t for t in usdt if float(t.get("vol", 0)) > 100000]
         usdt.sort(key=lambda x: float(x.get("changeRate", 0)), reverse=True)
-        result = {"gainers": usdt[:5], "losers": list(reversed(usdt))[:5]}
+        result  = {"gainers": usdt[:5], "losers": list(reversed(usdt))[:5]}
         _movers_cache["movers"] = result
         return result
-    except (aiohttp.ClientError, KeyError) as e:
+    except Exception as e:
         logger.error(f"fetch_top_movers error: {e}")
         return {"gainers": [], "losers": []}
 
-async def fetch_coin_info(symbol: str) -> dict | None:
+def fetch_coin_info(symbol: str) -> dict | None:
     symbol = clean_symbol(symbol)
-    if symbol in _coininfo_cache:
-        return _coininfo_cache[symbol]
+    if symbol in _coininfo_cache: return _coininfo_cache[symbol]
     id_map = {
         "BTC":"bitcoin","ETH":"ethereum","BNB":"binancecoin","SOL":"solana",
         "XRP":"ripple","ADA":"cardano","DOGE":"dogecoin","MATIC":"matic-network",
@@ -417,15 +370,11 @@ async def fetch_coin_info(symbol: str) -> dict | None:
     }
     coin_id = id_map.get(symbol, symbol.lower())
     try:
-        async with _get(
-            f"https://api.coingecko.com/api/v3/coins/{coin_id}",
-            params={"localization":"false","tickers":"false","community_data":"false"},
-            timeout=aiohttp.ClientTimeout(total=10)
-        ) as r:
-            d = await r.json()
-        if "error" in d:
-            return None
-        md = d.get("market_data", {})
+        r = _session.get(f"https://api.coingecko.com/api/v3/coins/{coin_id}",
+                         params={"localization":"false","tickers":"false","community_data":"false"}, timeout=10)
+        d = r.json()
+        if "error" in d: return None
+        md     = d.get("market_data", {})
         result = {
             "name":       d.get("name", symbol),
             "symbol":     d.get("symbol","").upper(),
@@ -444,33 +393,25 @@ async def fetch_coin_info(symbol: str) -> dict | None:
         }
         _coininfo_cache[symbol] = result
         return result
-    except (aiohttp.ClientError, KeyError) as e:
-        logger.error(f"fetch_coin_info error {symbol}: {e}")
-        return None
+    except Exception as e:
+        logger.error(f"fetch_coin_info error {symbol}: {e}"); return None
 
-async def call_grok(prompt: str) -> str | None:
-    if not GROK_API_KEY:
-        return None
+def call_grok_sync(prompt: str) -> str | None:
+    if not GROK_API_KEY: return None
     try:
-        async with _post(
+        r = _session.post(
             "https://api.x.ai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROK_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": "grok-3-fast",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 300,
-                "temperature": 0.7
-            },
-            timeout=aiohttp.ClientTimeout(total=15)
-        ) as r:
-            result = await r.json()
+            json={"model": "grok-3-fast", "messages": [{"role":"user","content":prompt}],
+                  "max_tokens": 300, "temperature": 0.7},
+            timeout=15
+        )
+        result = r.json()
         if "choices" not in result:
-            logger.error(f"Grok error: {result}")
-            return None
+            logger.error(f"Grok error: {result}"); return None
         return result["choices"][0]["message"]["content"].strip()
-    except (aiohttp.ClientError, KeyError) as e:
-        logger.error(f"call_grok error: {e}")
-        return None
+    except Exception as e:
+        logger.error(f"call_grok error: {e}"); return None
 
 # ── TECHNICAL INDICATORS ──────────────────────────────────────────────────────
 def compute_all(df: pd.DataFrame) -> dict:
@@ -705,7 +646,7 @@ def score(ind: dict) -> dict:
     }
 
 # ── GROK AI ───────────────────────────────────────────────────────────────────
-async def get_grok_analysis(symbol: str, ind: dict, pred: dict) -> str | None:
+def get_grok_analysis(symbol: str, ind: dict, pred: dict) -> str | None:
     prompt = (
         f"You are an expert crypto analyst. Analyze {symbol}/USDT and provide a sharp, "
         f"confident 3-4 sentence analysis.\n\n"
@@ -726,7 +667,7 @@ async def get_grok_analysis(symbol: str, ind: dict, pred: dict) -> str | None:
         f"KEY_LEVEL: [Most important price level]\n"
         f"OUTLOOK: [One line short-term outlook]"
     )
-    return await call_grok(prompt)
+    return call_grok_sync(prompt)
 
 def format_grok_section(grok_text: str) -> str:
     if not grok_text:
@@ -988,7 +929,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ Analyzing *{symbol}/USDT* on {tf_label}...\n_Running 15+ indicators_ 📊",
             parse_mode="Markdown"
         )
-        df = await fetch_ohlcv(symbol, tf)
+        df = fetch_ohlcv(symbol, tf)
         if df is None or len(df) < 60:
             await query.edit_message_text(
                 f"❌ *{symbol}/USDT* not found.", reply_markup=back_kb(), parse_mode="Markdown"
@@ -1002,7 +943,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⏳ Running Grok AI for *{symbol}*...\n_Checking X sentiment_ 🤖",
                 parse_mode="Markdown"
             )
-            grok_text = await get_grok_analysis(symbol, ind, pred)
+            grok_text = get_grok_analysis(symbol, ind, pred)
         msg = format_analysis(symbol, tf_label, ind, pred, premium, grok_text)
         await increment_analysis(uid)
         kb = InlineKeyboardMarkup([
@@ -1016,12 +957,12 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── MARKET OVERVIEW ──
     elif data == "menu_market":
         await query.edit_message_text("⏳ Fetching market data...", parse_mode="Markdown")
-        fg    = await fetch_fear_greed()
+        fg    = fetch_fear_greed()
         fg_e  = "🟢" if fg["value"] >= 60 else "🔴" if fg["value"] <= 40 else "🟡"
         lines = [f"{LOGO}\n{DIVIDER}", f"🌍 *Market Overview*\n",
                  f"{fg_e} Fear & Greed: *{fg['value']}/100* — _{fg['label']}_\n", DIVIDER]
         for coin in TOP_COINS:
-            d = await fetch_24h(coin)
+            d = fetch_24h(coin)
             if d:
                 e = "📈" if d["change"] >= 0 else "📉"
                 lines.append(f"{e} *{coin}:* `${d['price']:,.4f}` `{d['change']:+.2f}%`")
@@ -1031,7 +972,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── TOP MOVERS ──
     elif data == "menu_movers":
         await query.edit_message_text("⏳ Fetching top movers...", parse_mode="Markdown")
-        movers = await fetch_top_movers()
+        movers = fetch_top_movers()
         lines  = [f"{LOGO}\n{DIVIDER}", "📈 *TOP GAINERS (24H)*\n"]
         for i, t in enumerate(movers["gainers"], 1):
             sym   = t["symbol"].replace("-USDT","")
@@ -1049,7 +990,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── FEAR & GREED ──
     elif data == "menu_fg":
-        fg  = await fetch_fear_greed()
+        fg  = fetch_fear_greed()
         val = fg["value"]
         if val >= 75:   e,desc = "🤑","Extreme Greed — Market may be overheated"
         elif val >= 55: e,desc = "😀","Greed — Bullish sentiment dominates"
@@ -1170,7 +1111,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["alert_symbol"]    = symbol
         context.user_data["alert_direction"] = direction
         context.user_data["action"]          = "alert_price"
-        price = await fetch_price(symbol)
+        price = fetch_price(symbol)
         price_hint = f"Current price: `${price:,.4f}`" if price else ""
         e = "📈" if direction == "above" else "📉"
         await query.edit_message_text(
@@ -1213,7 +1154,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not a:
             await query.answer("Alert not found."); return
         e = "📈" if a["direction"] == "above" else "📉"
-        p = await fetch_price(a["symbol"])
+        p = fetch_price(a["symbol"])
         current = f"${p:,.4f}" if p else "N/A"
         status  = "⏳ Waiting..." if not p else \
                   ("✅ Target reached!" if (a["direction"]=="above" and p>=a["target"]) or
@@ -1245,7 +1186,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_invested = 0; total_current = 0
         lines = [f"{LOGO}\n{DIVIDER}", "💼 *My Portfolio*\n"]
         for h in portfolio:
-            price = await fetch_price(h["symbol"])
+            price = fetch_price(h["symbol"])
             if price is None: continue
             invested = h["amount"] * h["buy_price"]
             current  = h["amount"] * price
@@ -1281,7 +1222,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── NEWS ──
     elif data == "menu_news":
         await query.edit_message_text("⏳ Fetching latest news...", parse_mode="Markdown")
-        news = await fetch_news()
+        news = fetch_news()
         if not news:
             await query.edit_message_text("📰 Could not fetch news.", reply_markup=back_kb(), parse_mode="Markdown")
             return
@@ -1301,7 +1242,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("coininfo|"):
         symbol = data.split("|")[1]
         await query.edit_message_text(f"⏳ Fetching {symbol} info...", parse_mode="Markdown")
-        info = await fetch_coin_info(symbol)
+        info = fetch_coin_info(symbol)
         if not info:
             await query.edit_message_text(f"❌ Could not fetch *{symbol}*.", reply_markup=back_kb(), parse_mode="Markdown")
             return
@@ -1595,7 +1536,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         symbol = clean_symbol(text)
         context.user_data["action"] = None
         await update.message.reply_text(f"⏳ Fetching *{symbol}* info...", parse_mode="Markdown")
-        info = await fetch_coin_info(symbol)
+        info = fetch_coin_info(symbol)
         if not info:
             await update.message.reply_text(f"❌ Could not find *{symbol}*.", parse_mode="Markdown")
             return
@@ -1737,7 +1678,7 @@ async def build_signal_message(now: datetime) -> str:
         "",
     ]
     for coin in SIGNAL_COINS:
-        df = await fetch_ohlcv(coin, "1d", 200)
+        df = fetch_ohlcv(coin, "1d", 200)
         if df is None or len(df) < 60:
             continue
         ind   = compute_all(df)
@@ -1745,7 +1686,7 @@ async def build_signal_message(now: datetime) -> str:
         sig_e = "🟢" if pred["signal"]=="BUY" else "🔴" if pred["signal"]=="SELL" else "🟡"
         dir_e = "📈" if pred["direction"]=="UP" else "📉"
         bar   = "█"*(pred["confidence"]//10) + "░"*(10-pred["confidence"]//10)
-        grok  = await get_grok_analysis(coin, ind, pred)
+        grok  = get_grok_analysis(coin, ind, pred)
         grok_sentiment = "N/A"
         if grok:
             for gl in grok.splitlines():
@@ -1783,7 +1724,7 @@ async def check_alerts_job(context):
         by_symbol.setdefault(a["symbol"], []).append(a)
     # Check each symbol once
     for symbol, symbol_alerts in by_symbol.items():
-        price = await fetch_price(symbol)
+        price = fetch_price(symbol)
         if price is None:
             continue
         for a in symbol_alerts:
@@ -1870,7 +1811,7 @@ async def generatepost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     await update.message.reply_text("⏳ Generating X post with Grok AI...")
     try:
-        df = await fetch_ohlcv("BTC", "1d", 200)
+        df = fetch_ohlcv("BTC", "1d", 200)
         if df is None or len(df) < 60:
             await update.message.reply_text("❌ Could not fetch market data."); return
         ind  = compute_all(df)
@@ -1886,7 +1827,7 @@ async def generatepost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"- End with @AtomicCrypto_bot\n- No markdown, plain text only\n"
             f"Return ONLY the post text, nothing else."
         )
-        post_text = await call_grok(prompt)
+        post_text = call_grok_sync(prompt)
         if not post_text:
             await update.message.reply_text("❌ Grok unavailable. Try again later."); return
         # Strip any markdown wrappers Grok may add
@@ -1902,15 +1843,11 @@ async def generatepost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 async def post_init(application):
     await init_db()
-    await get_session()  # Initialize global HTTP session on startup
     logger.info("✅ Database initialized")
-    logger.info("✅ HTTP session initialized")
+    logger.info("✅ Requests session ready")
 
 async def post_shutdown(application):
-    global _http_session
-    if _http_session and not _http_session.closed:
-        await _http_session.close()
-        logger.info("✅ HTTP session closed")
+    logger.info("✅ Bot shut down cleanly")
 
 def main():
     app = (
@@ -1943,7 +1880,7 @@ def main():
     print("⚡ Atomic Crypto Bot v3.1 — Professional Edition")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print("✅ SQLite database")
-    print("✅ Global aiohttp session")
+    print("✅ Requests session (proxy compatible)")
     print("✅ Smart caching")
     print("✅ Optimized alerts")
     print("✅ Atomic SQL increments")

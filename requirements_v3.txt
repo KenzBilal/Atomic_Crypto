@@ -1,5 +1,5 @@
 python-telegram-bot[job-queue]
-aiohttp
+requests
 aiosqlite
 pandas
 numpy
