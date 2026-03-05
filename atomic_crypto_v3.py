@@ -42,6 +42,17 @@ async def get_session() -> aiohttp.ClientSession:
         _http_session = aiohttp.ClientSession(connector=connector)
     return _http_session
 
+# PythonAnywhere proxy
+PROXY = "http://proxy.server:3128"
+
+async def _get(url, **kwargs):
+    session = await get_session()
+    return session.get(url, proxy=PROXY, ssl=False, **kwargs)
+
+async def _post(url, **kwargs):
+    session = await get_session()
+    return session.post(url, proxy=PROXY, ssl=False, **kwargs)
+
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN        = os.environ["TELEGRAM_TOKEN"]
 ADMIN_ID              = int(os.environ.get("ADMIN_ID", "8466348943"))
@@ -281,8 +292,7 @@ async def fetch_ohlcv(symbol: str, interval: str, limit: int = 200):
     interval_map = {"1h": "1hour", "4h": "4hour", "1d": "1day"}
     kc_interval  = interval_map.get(interval, "1hour")
     try:
-        session = await get_session()
-        async with session.get(
+        async with _get(
             "https://api.kucoin.com/api/v1/market/candles",
             params={"symbol": f"{symbol}-USDT", "type": kc_interval},
             timeout=aiohttp.ClientTimeout(total=10)
@@ -305,8 +315,7 @@ async def fetch_price(symbol: str) -> float | None:
     if symbol in _price_cache:
         return _price_cache[symbol]
     try:
-        session = await get_session()
-        async with session.get(
+        async with _get(
             "https://api.kucoin.com/api/v1/market/orderbook/level1",
             params={"symbol": f"{symbol}-USDT"},
             timeout=aiohttp.ClientTimeout(total=5)
@@ -323,8 +332,7 @@ async def fetch_24h(symbol: str) -> dict | None:
     if symbol in _24h_cache:
         return _24h_cache[symbol]
     try:
-        session = await get_session()
-        async with session.get(
+        async with _get(
             "https://api.kucoin.com/api/v1/market/stats",
             params={"symbol": f"{symbol}-USDT"},
             timeout=aiohttp.ClientTimeout(total=5)
@@ -350,8 +358,7 @@ async def fetch_fear_greed() -> dict:
     if "fg" in _fg_cache:
         return _fg_cache["fg"]
     try:
-        session = await get_session()
-        async with session.get(
+        async with _get(
             "https://api.alternative.me/fng/",
             timeout=aiohttp.ClientTimeout(total=5)
         ) as r:
@@ -367,8 +374,7 @@ async def fetch_news() -> list:
     if "news" in _news_cache:
         return _news_cache["news"]
     try:
-        session = await get_session()
-        async with session.get(
+        async with _get(
             "https://min-api.cryptocompare.com/data/v2/news/?lang=EN&sortOrder=latest",
             timeout=aiohttp.ClientTimeout(total=8)
         ) as r:
@@ -384,8 +390,7 @@ async def fetch_top_movers() -> dict:
     if "movers" in _movers_cache:
         return _movers_cache["movers"]
     try:
-        session = await get_session()
-        async with session.get(
+        async with _get(
             "https://api.kucoin.com/api/v1/market/allTickers",
             timeout=aiohttp.ClientTimeout(total=10)
         ) as r:
@@ -412,8 +417,7 @@ async def fetch_coin_info(symbol: str) -> dict | None:
     }
     coin_id = id_map.get(symbol, symbol.lower())
     try:
-        session = await get_session()
-        async with session.get(
+        async with _get(
             f"https://api.coingecko.com/api/v3/coins/{coin_id}",
             params={"localization":"false","tickers":"false","community_data":"false"},
             timeout=aiohttp.ClientTimeout(total=10)
@@ -448,8 +452,7 @@ async def call_grok(prompt: str) -> str | None:
     if not GROK_API_KEY:
         return None
     try:
-        session = await get_session()
-        async with session.post(
+        async with _post(
             "https://api.x.ai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROK_API_KEY}", "Content-Type": "application/json"},
             json={
