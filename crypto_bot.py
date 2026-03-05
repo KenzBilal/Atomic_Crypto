@@ -1970,7 +1970,12 @@ async def generatepost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             },
             timeout=15
         )
-        post_text = r.json()["choices"][0]["message"]["content"].strip()
+        result = r.json()
+        logger.info(f"Grok response: {result}")
+        if "choices" not in result:
+            await update.message.reply_text(f"❌ Grok error: {result.get('error', result)}")
+            return
+        post_text = result["choices"][0]["message"]["content"].strip()
 
         await update.message.reply_text(
             f"✅ *Ready to post on X:*\n\n"
