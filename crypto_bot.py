@@ -1,15 +1,12 @@
 """
-⚡ ATOMIC CRYPTO BOT — PROFESSIONAL EDITION v3.0
+⚡ ATOMIC CRYPTO BOT — PROFESSIONAL EDITION v3.1
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-v3.0 Upgrades:
-  ✅ SQLite database (aiosqlite) — no data loss
-  ✅ Fully async HTTP (aiohttp) — never freezes
-  ✅ Smart caching (cachetools) — no rate limits
-  ✅ .env security — no hardcoded secrets
-  ✅ Optimized alerts — grouped by symbol
-  ✅ Specific exception handling
-  ✅ Pandas .loc fixes
-  ✅ All v2.0 features preserved
+v3.1 Fixes (Gemini Review):
+  ✅ Global aiohttp session — connection pooling
+  ✅ Daily signals built once, sent to all users
+  ✅ Atomic SQL increments — no race conditions
+  ✅ Graceful shutdown — no memory leaks
+  ✅ Grok output stripped of markdown wrappers
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -34,6 +31,15 @@ from telegram.ext import (
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ── GLOBAL HTTP SESSION ───────────────────────────────────────────────────────
+_http_session: aiohttp.ClientSession | None = None
+
+async def get_session() -> aiohttp.ClientSession:
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession()
+    return _http_session
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN        = os.environ["TELEGRAM_TOKEN"]
@@ -171,15 +177,17 @@ async def check_daily_limit(uid: str) -> tuple:
     return remaining > 0, max(0, remaining)
 
 async def increment_analysis(uid: str):
-    user  = await get_user(uid)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    count = user["analyses_today"] if user["analyses_date"] == today else 0
-    await update_user(
-        uid,
-        analyses_today=count + 1,
-        analyses_date=today,
-        total_analyses=user["total_analyses"] + 1
-    )
+    async with aiosqlite.connect(DB_FILE) as db:
+        # Reset daily count if it's a new day, then increment atomically
+        await db.execute("""
+            UPDATE users SET
+                analyses_today = CASE WHEN analyses_date = ? THEN analyses_today + 1 ELSE 1 END,
+                analyses_date  = ?,
+                total_analyses = total_analyses + 1
+            WHERE uid = ?
+        """, (today, today, uid))
+        await db.commit()
 
 async def get_alerts(uid: str = None) -> list:
     async with aiosqlite.connect(DB_FILE) as db:
@@ -271,15 +279,14 @@ async def fetch_ohlcv(symbol: str, interval: str, limit: int = 200):
         return _ohlcv_cache[cache_key]
     interval_map = {"1h": "1hour", "4h": "4hour", "1d": "1day"}
     kc_interval  = interval_map.get(interval, "1hour")
-    pair = f"{symbol}-USDT"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://api.kucoin.com/api/v1/market/candles",
-                params={"symbol": pair, "type": kc_interval},
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as r:
-                data = (await r.json()).get("data", [])
+        session = await get_session()
+        async with session.get(
+            "https://api.kucoin.com/api/v1/market/candles",
+            params={"symbol": f"{symbol}-USDT", "type": kc_interval},
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            data = (await r.json()).get("data", [])
         if not data:
             return None
         data = list(reversed(data))[-limit:]
@@ -297,13 +304,13 @@ async def fetch_price(symbol: str) -> float | None:
     if symbol in _price_cache:
         return _price_cache[symbol]
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://api.kucoin.com/api/v1/market/orderbook/level1",
-                params={"symbol": f"{symbol}-USDT"},
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as r:
-                price = float((await r.json())["data"]["price"])
+        session = await get_session()
+        async with session.get(
+            "https://api.kucoin.com/api/v1/market/orderbook/level1",
+            params={"symbol": f"{symbol}-USDT"},
+            timeout=aiohttp.ClientTimeout(total=5)
+        ) as r:
+            price = float((await r.json())["data"]["price"])
         _price_cache[symbol] = price
         return price
     except (aiohttp.ClientError, KeyError, TypeError) as e:
@@ -315,13 +322,13 @@ async def fetch_24h(symbol: str) -> dict | None:
     if symbol in _24h_cache:
         return _24h_cache[symbol]
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://api.kucoin.com/api/v1/market/stats",
-                params={"symbol": f"{symbol}-USDT"},
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as r:
-                d = (await r.json()).get("data", {})
+        session = await get_session()
+        async with session.get(
+            "https://api.kucoin.com/api/v1/market/stats",
+            params={"symbol": f"{symbol}-USDT"},
+            timeout=aiohttp.ClientTimeout(total=5)
+        ) as r:
+            d = (await r.json()).get("data", {})
         if not d:
             return None
         last   = float(d.get("last", 0))
@@ -342,12 +349,12 @@ async def fetch_fear_greed() -> dict:
     if "fg" in _fg_cache:
         return _fg_cache["fg"]
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://api.alternative.me/fng/",
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as r:
-                d = (await r.json())["data"][0]
+        session = await get_session()
+        async with session.get(
+            "https://api.alternative.me/fng/",
+            timeout=aiohttp.ClientTimeout(total=5)
+        ) as r:
+            d = (await r.json())["data"][0]
         result = {"value": int(d["value"]), "label": d["value_classification"]}
         _fg_cache["fg"] = result
         return result
@@ -359,12 +366,12 @@ async def fetch_news() -> list:
     if "news" in _news_cache:
         return _news_cache["news"]
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://min-api.cryptocompare.com/data/v2/news/?lang=EN&sortOrder=latest",
-                timeout=aiohttp.ClientTimeout(total=8)
-            ) as r:
-                items = (await r.json()).get("Data", [])[:5]
+        session = await get_session()
+        async with session.get(
+            "https://min-api.cryptocompare.com/data/v2/news/?lang=EN&sortOrder=latest",
+            timeout=aiohttp.ClientTimeout(total=8)
+        ) as r:
+            items = (await r.json()).get("Data", [])[:5]
         result = [{"title": i["title"], "url": i["url"], "source": i["source_info"]["name"]} for i in items]
         _news_cache["news"] = result
         return result
@@ -376,12 +383,12 @@ async def fetch_top_movers() -> dict:
     if "movers" in _movers_cache:
         return _movers_cache["movers"]
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://api.kucoin.com/api/v1/market/allTickers",
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as r:
-                tickers = (await r.json()).get("data", {}).get("ticker", [])
+        session = await get_session()
+        async with session.get(
+            "https://api.kucoin.com/api/v1/market/allTickers",
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            tickers = (await r.json()).get("data", {}).get("ticker", [])
         usdt = [t for t in tickers if t["symbol"].endswith("-USDT") and t.get("changeRate")]
         usdt = [t for t in usdt if float(t.get("vol", 0)) > 100000]
         usdt.sort(key=lambda x: float(x.get("changeRate", 0)), reverse=True)
@@ -404,13 +411,13 @@ async def fetch_coin_info(symbol: str) -> dict | None:
     }
     coin_id = id_map.get(symbol, symbol.lower())
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"https://api.coingecko.com/api/v3/coins/{coin_id}",
-                params={"localization":"false","tickers":"false","community_data":"false"},
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as r:
-                d = await r.json()
+        session = await get_session()
+        async with session.get(
+            f"https://api.coingecko.com/api/v3/coins/{coin_id}",
+            params={"localization":"false","tickers":"false","community_data":"false"},
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as r:
+            d = await r.json()
         if "error" in d:
             return None
         md = d.get("market_data", {})
@@ -440,19 +447,19 @@ async def call_grok(prompt: str) -> str | None:
     if not GROK_API_KEY:
         return None
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://api.x.ai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROK_API_KEY}", "Content-Type": "application/json"},
-                json={
-                    "model": "grok-3-fast",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 300,
-                    "temperature": 0.7
-                },
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as r:
-                result = await r.json()
+        session = await get_session()
+        async with session.post(
+            "https://api.x.ai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROK_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "grok-3-fast",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 300,
+                "temperature": 0.7
+            },
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            result = await r.json()
         if "choices" not in result:
             logger.error(f"Grok error: {result}")
             return None
@@ -1802,6 +1809,9 @@ async def daily_signals_job(context):
     now      = datetime.now(timezone.utc)
     now_time = f"{now.hour:02d}:{now.minute:02d}"
 
+    # Build the message ONCE — reused for channel + all users
+    msg = None
+
     if now_time == "09:00":
         try:
             msg = await build_signal_message(now)
@@ -1821,9 +1831,16 @@ async def daily_signals_job(context):
         ) as cur:
             rows = await cur.fetchall()
 
+    if not rows:
+        return
+
+    # Build once if not already built for channel post
+    if msg is None:
+        msg = await build_signal_message(now)
+
+    # Send same pre-built message to all users — zero extra API calls
     for row in rows:
         try:
-            msg = await build_signal_message(now)
             await context.bot.send_message(
                 chat_id=int(row["uid"]), text=msg,
                 parse_mode=None, disable_web_page_preview=True
@@ -1868,6 +1885,9 @@ async def generatepost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         post_text = await call_grok(prompt)
         if not post_text:
             await update.message.reply_text("❌ Grok unavailable. Try again later."); return
+        # Strip any markdown wrappers Grok may add
+        post_text = post_text.strip().removeprefix("```").removesuffix("```")
+        post_text = post_text.strip().removeprefix("text").strip()
         await update.message.reply_text(
             f"✅ *Ready to post on X:*\n\n`{post_text}`\n\n👆 Tap to copy, paste on X!",
             parse_mode="Markdown"
@@ -1878,13 +1898,22 @@ async def generatepost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 async def post_init(application):
     await init_db()
+    await get_session()  # Initialize global HTTP session on startup
     logger.info("✅ Database initialized")
+    logger.info("✅ HTTP session initialized")
+
+async def post_shutdown(application):
+    global _http_session
+    if _http_session and not _http_session.closed:
+        await _http_session.close()
+        logger.info("✅ HTTP session closed")
 
 def main():
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
@@ -1907,12 +1936,14 @@ def main():
     app.job_queue.run_repeating(check_alerts_job,  interval=60, first=10)
     app.job_queue.run_repeating(daily_signals_job, interval=60, first=30)
 
-    print("⚡ Atomic Crypto Bot v3.0 — Professional Edition")
+    print("⚡ Atomic Crypto Bot v3.1 — Professional Edition")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print("✅ SQLite database")
-    print("✅ Async HTTP (aiohttp)")
+    print("✅ Global aiohttp session")
     print("✅ Smart caching")
     print("✅ Optimized alerts")
+    print("✅ Atomic SQL increments")
+    print("✅ Graceful shutdown")
     print("✅ .env security")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
