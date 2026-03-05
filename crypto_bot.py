@@ -547,7 +547,7 @@ OUTLOOK: [One line short-term outlook]"""
                 "Content-Type": "application/json"
             },
             json={
-                "model": "grok-2-1212",
+                "model": "grok-3-fast",
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 300,
                 "temperature": 0.7
@@ -1939,7 +1939,7 @@ async def generatepost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Content-Type": "application/json"
             },
             json={
-                "model": "grok-2-1212",
+                "model": "grok-3-fast",
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 100,
                 "temperature": 0.8
