@@ -1927,7 +1927,61 @@ async def daily_signals_job(context):
         except Exception as e:
             logger.error(f"Daily signal error for {uid}: {e}")
 
-async def postsignals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def generatepost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate a ready-to-post X/Twitter post using Grok"""
+    await update.message.reply_text("⏳ Generating X post with Grok AI...")
+    try:
+        # Get BTC signal as base
+        df = fetch_ohlcv("BTC", "1d", 200)
+        if df is None or len(df) < 60:
+            await update.message.reply_text("❌ Could not fetch market data.")
+            return
+        ind  = compute_all(df)
+        pred = score(ind)
+        sig_e = "🟢" if pred["signal"]=="BUY" else "🔴" if pred["signal"]=="SELL" else "🟡"
+
+        prompt = (
+            f"Write a professional crypto signal post for X (Twitter). "
+            f"Today's BTC signal: {pred['signal']} with {pred['confidence']}% confidence. "
+            f"Direction: {pred['direction']}. RSI: {ind['rsi']}. "
+            f"MACD: {ind['macd_cross']}. Price: ${ind['price']:,.2f}. "
+            f"Check X/Twitter for current BTC sentiment too.\n\n"
+            f"Requirements:\n"
+            f"- Max 280 characters\n"
+            f"- Include signal, price, confidence\n"
+            f"- Add 3-4 relevant hashtags\n"
+            f"- Energetic and professional tone\n"
+            f"- End with @AtomicCrypto_bot\n"
+            f"- No markdown, plain text only\n"
+            f"Return ONLY the post text, nothing else."
+        )
+
+        r = requests.post(
+            "https://api.x.ai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROK_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "grok-3-latest",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 100,
+                "temperature": 0.8
+            },
+            timeout=15
+        )
+        post_text = r.json()["choices"][0]["message"]["content"].strip()
+
+        await update.message.reply_text(
+            f"✅ *Ready to post on X:*\n\n"
+            f"`{post_text}`\n\n"
+            f"👆 Tap to copy, then paste on X!",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
     """Admin: manually trigger a channel signal post"""
     if int(update.effective_user.id) != ADMIN_ID:
         return
@@ -1960,7 +2014,8 @@ def main():
     app.add_handler(CommandHandler("revoke",    revoke_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("userinfo",  userinfo_cmd))
-    app.add_handler(CommandHandler("postsignals", postsignals_cmd))
+    app.add_handler(CommandHandler("postsignals",   postsignals_cmd))
+    app.add_handler(CommandHandler("generatepost",  generatepost_cmd))
 
     # Callbacks & messages
     app.add_handler(CallbackQueryHandler(menu_handler))
