@@ -1664,12 +1664,13 @@ async def check_alerts_job(context):
             update_user(uid, user)
 
 async def build_signal_message(now: datetime) -> str:
-    """Build the daily signal message for channel + users"""
+    """Build the daily signal message for channel + users — plain text only"""
     lines = [
-        f"{LOGO}",
-        f"{DIVIDER}",
-        f"📅 *Daily Signals — {now.strftime('%d %b %Y')} UTC*",
-        f"⏰ {now.strftime('%H:%M')} UTC\n",
+        "⚡ ATOMIC CRYPTO",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"📅 Daily Signals — {now.strftime('%d %b %Y')} UTC",
+        f"⏰ {now.strftime('%H:%M')} UTC",
+        "",
     ]
     for coin in SIGNAL_COINS:
         df = fetch_ohlcv(coin, "1d", 200)
@@ -1681,23 +1682,23 @@ async def build_signal_message(now: datetime) -> str:
         dir_e = "📈" if pred["direction"]=="UP" else "📉"
         bar   = "█"*(pred["confidence"]//10) + "░"*(10-pred["confidence"]//10)
         grok  = await get_grok_analysis(coin, ind, pred)
-        grok_sentiment = ""
+        grok_sentiment = "N/A"
         if grok:
-            for line in grok.splitlines():
-                if line.startswith("SENTIMENT:"):
-                    grok_sentiment = line.replace("SENTIMENT:","").strip()
+            for gl in grok.splitlines():
+                if "SENTIMENT" in gl and ":" in gl:
+                    grok_sentiment = gl.split(":",1)[1].strip()
+                    grok_sentiment = grok_sentiment.replace("*","").replace("_","").replace("`","")
                     break
         sent_e = "🟢" if "Bullish" in grok_sentiment else "🔴" if "Bearish" in grok_sentiment else "🟡"
-        lines.append(
-            f"{sig_e} *{coin}/USDT*\n"
-            f"   Price: {ind['price']:,.4f} USDT\n"
-            f"   {dir_e} Direction: {pred['direction']}\n"
-            f"   Confidence: {pred['confidence']}% {bar}\n"
-            f"   Signal: *{pred['signal']}*  Risk: {pred['risk']}\n"
-            f"   {sent_e} X Sentiment: {grok_sentiment}\n"
-        )
-    lines.append(f"{DIVIDER}")
-    lines.append("Powered by 15+ indicators")
+        lines.append(f"{sig_e} {coin}/USDT")
+        lines.append(f"   Price: ${ind['price']:,.4f}")
+        lines.append(f"   {dir_e} {pred['direction']} — Signal: {pred['signal']}")
+        lines.append(f"   Confidence: {pred['confidence']}% {bar}")
+        lines.append(f"   Risk: {pred['risk']}")
+        lines.append(f"   {sent_e} X Sentiment: {grok_sentiment}")
+        lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("Powered by 15 indicators + Grok AI")
     lines.append("Full analysis: @AtomicCrypto_bot")
     lines.append(f"Trade on BingX: {BINGX_LINK}")
     lines.append(f"Join Channel: {CHANNEL_LINK}")
@@ -1737,7 +1738,7 @@ async def daily_signals_job(context):
             await context.bot.send_message(
                 chat_id=int(uid),
                 text=msg,
-                parse_mode="Markdown",
+                parse_mode=None,
                 disable_web_page_preview=True
             )
         except Exception as e:
@@ -1747,19 +1748,19 @@ async def postsignals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: manually trigger a channel signal post"""
     if int(update.effective_user.id) != ADMIN_ID:
         return
-    await update.message.reply_text("⏳ Posting signals to channel...", parse_mode="Markdown")
+    await update.message.reply_text("⏳ Posting signals to channel...")
     try:
         now = datetime.now(timezone.utc)
         msg = await build_signal_message(now)
         await context.bot.send_message(
             chat_id=CHANNEL_USERNAME,
             text=msg,
-            parse_mode="Markdown",
+            parse_mode=None,
             disable_web_page_preview=True
         )
-        await update.message.reply_text("✅ Signals posted to channel!", parse_mode="Markdown")
+        await update.message.reply_text("✅ Signals posted to channel!")
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ Error: {e}")
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
